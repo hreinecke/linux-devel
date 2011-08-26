@@ -283,6 +283,15 @@ config DM_ZERO
 	  A target that discards writes, and returns all zeroes for
 	  reads.  Useful in some recovery situations.
 
+config DM_SSDCACHE
+	tristate "SSD Caching target (EXPERIMENTAL)"
+	depends on BLK_DEV_DM && EXPERIMENTAL
+	---help---
+	A target that uses a faster device (typically SSD)
+        to cache accesses to the underlying block device.
+
+	If unsure, say N.
+
 config DM_MULTIPATH
 	tristate "Multipath target"
 	depends on BLK_DEV_DM
