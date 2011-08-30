@@ -59,7 +59,6 @@ struct ssdcache_te {
 	unsigned long state;    /* State bitmap */
 	sector_t sector;	/* Sector number on target device */
 	struct ssdcache_md *md; /* Backlink to metadirectory */
-	struct bio_list pending;
 	struct bio_list writeback;
 	struct rcu_head rcu;
 };
@@ -88,7 +87,7 @@ struct ssdcache_c {
 	enum ssdcache_mode_t cache_mode;
 	unsigned long cache_hits;
 	unsigned long cache_bypassed;
-	unsigned long cache_pending;
+	unsigned long cache_requeue;
 };
 
 struct ssdcache_io {
@@ -357,7 +356,6 @@ struct ssdcache_te * cte_new(struct ssdcache_c *sc, struct ssdcache_md *cmd,
 		newstate |= (unsigned long)CTE_INVALID << (i * 4);
 	newcte->state = newstate;
 	newcte->md = cmd;
-	bio_list_init(&newcte->pending);
 	bio_list_init(&newcte->writeback);
 
 	return newcte;
@@ -671,18 +669,6 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	call_rcu(&oldcte->rcu, cte_reset);
 }
 
-static void cte_add_pending_bio(struct ssdcache_md *cmd, long index,
-				struct bio *bio)
-{
-	struct ssdcache_te *cte;
-	unsigned long flags;
-
-	spin_lock_irqsave(&cmd->lock, flags);
-	cte = cmd->te[index];
-	bio_list_add(&cte->pending, bio);
-	spin_unlock_irqrestore(&cmd->lock, flags);
-}
-
 static inline bool cte_match_sector(struct ssdcache_c *sc,
 				    struct ssdcache_te *cte,
 				    struct bio *bio)
@@ -885,8 +871,7 @@ static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
-	sio->bio = bio_list_pop(&oldcte->pending);
-	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
+
 	*newcte = *oldcte;
 	newcte->state = newstate;
 	newcte->atime = jiffies;
@@ -894,12 +879,8 @@ static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
 
-	if (!sio->bio) {
-		ssdcache_destroy_sio(sio);
-		sio = NULL;
-	}
-
-	return sio ? 1 : 0;
+	ssdcache_destroy_sio(sio);
+	return 0;
 }
 
 static int finish_update(struct ssdcache_io *sio, unsigned long error)
@@ -945,17 +926,7 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
-	/* Check for pending bio first */
-	sio->bio = bio_list_pop(&oldcte->pending);
-	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
-	if (sio->bio) {
-		WPRINTK(sio, "use pending bio");
-		if (bio_data_dir(sio->bio) == WRITE)
-			newstate = sio_update_state(sio, oldstate, CTE_UPDATE);
-		else if (state == CTE_INVALID) {
-			newstate = sio_update_state(sio, oldstate, CTE_PREFETCH);
-		}
-	}
+
 	*newcte = *oldcte;
 	newcte->state = newstate;
 	newcte->atime = jiffies;
@@ -965,7 +936,7 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
 
-	if (!sio->bio && !clone) {
+	if (!clone) {
 		ssdcache_destroy_sio(sio);
 		sio = NULL;
 	}
@@ -977,7 +948,7 @@ static int finish_read(struct ssdcache_io *sio, unsigned long error)
 	if (error) {
 		WPRINTK(sio, "error, mark cte invalid");
 		sio_set_state(sio, CTE_INVALID);
-	} else if (sio_is_state(CTE_CLEAN))
+	} else if (sio_is_state(sio, CTE_CLEAN))
 		sio_set_state(sio, CTE_CLEAN);
 	else
 		sio_set_state(sio, CTE_DIRTY);
@@ -1020,25 +991,14 @@ static int finish_writeback(struct ssdcache_io *sio, unsigned long error)
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
 	*newcte = *oldcte;
-	sio->bio = bio_list_pop(&newcte->pending);
-	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
-	if (sio->bio) {
-		WPRINTK(sio, "use pending bio");
-		if (bio_data_dir(sio->bio) == WRITE)
-			newstate = sio_update_state(sio, oldstate, CTE_UPDATE);
-	}
 	newcte->state = newstate;
 	newcte->atime = jiffies;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
 
-	if (!sio->bio) {
-		ssdcache_destroy_sio(sio);
-		sio = NULL;
-	}
-
-	return sio ? 1 : 0;
+	ssdcache_destroy_sio(sio);
+	return 0;
 }
 
 static void io_callback(unsigned long error, void *context)
@@ -1453,8 +1413,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	BUG_ON(!cte);
 	state = sio_get_state(sio);
 	sio->bio = bio;
-	sio->bio_private = bio->bi_private;
-	sio->bio_endio = bio->bi_end_io;
 
 	if (cte_match_sector(sc, cte, bio)) {
 		/* Cache hit */
@@ -1471,13 +1429,12 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 				return DM_MAPIO_REMAPPED;
 			} else {
 				/* Transaction in progress, delay */
-				cte_add_pending_bio(sio->cmd, sio->cte_idx, bio);
 				DPRINTK("%s: (cte %lx:%lx): delay cache hit",
 					__FUNCTION__, sio->cmd->index,
 					sio->cte_idx);
-				sc->cache_pending++;
+				sc->cache_requeue++;
 				ssdcache_destroy_sio(sio);
-				return DM_MAPIO_SUBMITTED;
+				return DM_MAPIO_REQUEUE;
 			}
 		}
 		sio->nr = ++sc->nr_sio;
@@ -1498,30 +1455,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		} else {
 			cte_start_sequence(sio, CTE_UPDATE);
 			res = write_to_cache(sio);
-#if 0
-			sio->bio = bio_clone(bio, GFP_NOWAIT);
-			bio_for_each_segment(bvec, bio, i)
-				get_page(bvec->bv_page);
-			if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
-				sio->endio = bio->bi_end_io;
-				sio->endio_data = bio->bi_end_io_data;
-				bio->bi_bdev = sc->target_dev->bdev;
-				res = write_to_cache(sio);
-			} else {
-				bio->bi_bdev = sc->cache_dev->bdev;
-				res = write_to_target(sio);
-			}
-
-#endif			res = DM_MAPIO_REMAPPED;
 		}
 	} else {
 		if (sio_is_state(sio, CTE_DIRTY)) {
 			DPRINTK("%s: (cte %lx:%lx): wait for writeback",
 				__FUNCTION__, sio->cmd->index, sio->cte_idx);
-			cte_add_pending_bio(sio->cmd, sio->cte_idx, bio);
-			sc->cache_pending++;
+			sc->cache_requeue++;
 			ssdcache_destroy_sio(sio);
-			return DM_MAPIO_SUBMITTED;
+			return DM_MAPIO_REQUEUE;
 		}
 		sio->nr = ++sc->nr_sio;
 		WPRINTK(sio, "miss %llu state %08lx/%08lx",
@@ -1616,7 +1557,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		sc->cache_mode = default_cache_mode;
 	}
 
-	sc->iocp = dm_io_client_create(SSDCACHE_COPY_PAGES);
+	sc->iocp = dm_io_client_create();
 	if (IS_ERR(sc->iocp)) {
 		r = PTR_ERR(sc->iocp);
 		ti->error = "Failed to create io client\n";
@@ -1729,7 +1670,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * sc->assoc,
 			 sc->nr_sio, sc->cache_hits,
-			 sc->cache_pending, sc->cache_bypassed);
+			 sc->cache_requeue, sc->cache_bypassed);
 		break;
 
 	case STATUSTYPE_TABLE:
