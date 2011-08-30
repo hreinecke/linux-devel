@@ -136,8 +136,6 @@ enum cte_state {
 	CTE_RESERVED,	/* Sector valid, Transfer target data into cache */
 	CTE_UPDATE,	/* Sector valid, Write cache data */
 	CTE_WRITEBACK,	/* Sector valid, Transfer cache data to target */
-	CTE_READ_CLEAN, /* Sector valid, Read from clean cache */
-	CTE_READ_DIRTY, /* Sector valid, Read from dirty cache */
 };
 
 /* Cache table entry state encoding */
@@ -288,8 +286,6 @@ static const struct {
 	{ CTE_RESERVED, "CTE_RESERVED" },
 	{ CTE_UPDATE, "CTE_UPDATE" },
 	{ CTE_WRITEBACK, "CTE_WRITEBACK" },
-	{ CTE_READ_CLEAN, "CTE_READ_CLEAN" },
-	{ CTE_READ_DIRTY, "CTE_READ_DIRTY" },
 };
 
 const char *cte_state_name(enum cte_state state)
@@ -436,8 +432,6 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		case CTE_PREFETCH:
 		case CTE_RESERVED:
 		case CTE_UPDATE:
-		case CTE_READ_CLEAN:
-		case CTE_READ_DIRTY:
 			break;
 		default:
 			illegal_transition++;
@@ -448,7 +442,6 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		switch (oldstate) {
 		case CTE_WRITEBACK:
 		case CTE_RESERVED:
-		case CTE_READ_CLEAN:
 			break;
 		default:
 			illegal_transition++;
@@ -459,7 +452,6 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		switch (oldstate) {
 		case CTE_WRITEBACK:
 		case CTE_UPDATE:
-		case CTE_READ_DIRTY:
 			break;
 		default:
 			illegal_transition++;
@@ -491,14 +483,6 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		}
 		break;
 	case CTE_WRITEBACK:
-		if (oldstate != CTE_DIRTY)
-			illegal_transition++;
-		break;
-	case CTE_READ_CLEAN:
-		if (oldstate != CTE_CLEAN)
-			illegal_transition++;
-		break;
-	case CTE_READ_DIRTY:
 		if (oldstate != CTE_DIRTY)
 			illegal_transition++;
 		break;
@@ -663,6 +647,44 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	*newcte = *oldcte;
 	newcte->sector = cte_bio_align(sio->sc, sio->bio);
 	newcte->state = newstate;
+	newcte->atime = jiffies;
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
+	spin_unlock_irqrestore(&sio->cmd->lock, flags);
+	call_rcu(&oldcte->rcu, cte_reset);
+}
+
+/*
+ * cte_restart_sequence
+ *
+ * Setup a sio to start a sequence with no state change.
+ * Only valid for read requests in CTE_DIRTY or CTE_CLEAN.
+ */
+static void cte_restart_sequence(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *oldcte, *newcte;
+	sector_t sector;
+	unsigned long flags;
+
+	BUG_ON(!sio->bio);
+	BUG_ON(sio->cte_idx < 0);
+
+	rcu_read_lock();
+	sector = rcu_dereference(sio->cmd->te[sio->cte_idx])->sector;
+	rcu_read_unlock();
+
+	if (sector != cte_bio_align(sio->sc, sio->bio)) {
+		WPRINTK(sio, "access to non sector %llx/%llx",
+			(unsigned long long)cte_bio_align(sio->sc, sio->bio),
+			(unsigned long long)sector);
+	}
+
+	newcte = mempool_alloc(_cte_pool, GFP_NOWAIT | __GFP_ZERO);
+	if (!newcte)
+		return;
+
+	spin_lock_irqsave(&sio->cmd->lock, flags);
+	oldcte = sio->cmd->te[sio->cte_idx];
+	*newcte = *oldcte;
 	newcte->atime = jiffies;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
@@ -943,15 +965,12 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 	return sio ? 1 : 0;
 }
 
-static int finish_read(struct ssdcache_io *sio, unsigned long error)
+static int finish_nochange(struct ssdcache_io *sio, unsigned long error)
 {
 	if (error) {
 		WPRINTK(sio, "error, mark cte invalid");
 		sio_set_state(sio, CTE_INVALID);
-	} else if (sio_is_state(sio, CTE_CLEAN))
-		sio_set_state(sio, CTE_CLEAN);
-	else
-		sio_set_state(sio, CTE_DIRTY);
+	}
 	/* Finish I/O and complete sio item */
 	bio_endio(sio->bio, error ? -EIO : 0);
 	sio->bio = NULL;
@@ -1019,7 +1038,7 @@ static void io_callback(unsigned long error, void *context)
 		requeue = finish_writeback(sio, error);
 	} else if (sio_is_state(sio, CTE_CLEAN) ||
 		   sio_is_state(sio, CTE_DIRTY)) {
-		requeue = finish_read(sio, error);
+		requeue = finish_nochange(sio, error);
 	} else {
 		WPRINTK(sio, "unhandled state %08lx",
 			sio_get_state(sio));
@@ -1436,10 +1455,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
 		if (bio_data_dir(bio) == READ) {
-			if (sio_is_state(sio, CTE_CLEAN))
-				cte_start_sequence(sio, CTE_READ_CLEAN);
-			else
-				cte_start_sequence(sio, CTE_READ_DIRTY);
+			cte_restart_sequence(sio);
 			res = read_from_cache(sio);
 		} else if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			sio_set_state(sio, CTE_INVALID);
