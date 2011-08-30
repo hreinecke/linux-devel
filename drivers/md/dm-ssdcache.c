@@ -460,7 +460,6 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 	case CTE_PREFETCH:
 		switch (oldstate) {
 		case CTE_INVALID:
-		case CTE_CLEAN:
 			break;
 		default:
 			illegal_transition++;
@@ -1240,22 +1239,41 @@ static int read_from_target(struct ssdcache_io *sio, int pad)
 	return dm_io(&iorq, 1, &target, NULL);
 }
 
+#if 0
 static int copy_bvec_to_bio(struct ssdcache_io *sio, struct bio *bio)
 {
 	struct bio_vec *bvec;
 	int i, ret = 0;
 
-	for (i = 0; i < sio->bvec_count; i++) {
-		bvec = &sio->bvec[i];
-		get_page(bvec->bv_page);
-		ret = bio_add_page(bio, bvec->bv_page, bvec->bv_len,
-				   bvec->bv_offset);
-		if (ret)
-			break;
+	dst_idx = bio->bi_idx;
+	dst_len = bio->bi_size;
+	src_bvec_size = 0;
+	dst_bvec_size = 0;
+	src_sector = sio->bvec_sector;
+	dst_sector = bio->bi_sector;
+	for (src_idx = 0; src_idx < sio->bvec_count; src_idx++) {
+		src_bvec = &sio->bvec[src_idx];
+		get_page(src_bvec->bv_page);
+		src_offset = to_sector(src_bvec->bv_offset + src_bvec->bv_len);
+		if (dst_sector < src_sector + src_offset) {
+			src_sector += src_offset;
+			continue;
+		}
+		src_addr = page_addres(src_bvec->bv_page);
+		dst_bvec = bio_iovec_idx(bio, dst_idx);
+		src_offset = to_bytes(dst_sector - src_sector) +
+			dst_bvec->bv_offset;
+
+		dst_addr = page_address(dst_bvec->bv_page);
+		dst_offset = dst_bvec->bv_offset;
+		memcpy(dst_addr + dst_offset, src_addr + src_offset, dst_len);
+		bvec_kunmap_irq(src_data, &flags);
+		dst_idx++;
 	}
 
 	return ret;
 }
+#endif
 
 static int do_io(struct ssdcache_io *sio)
 {
