@@ -1365,13 +1365,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	offset = cte_bio_offset(sc, bio);
 	hash_number = hash_block(sc, data_sector);
 
-	DPRINTK("Got a %s for %llu ((%llu:%llu):(%lx), %u bytes)",
-		bio_rw(bio) == WRITE ? "WRITE" : (bio_rw(bio) == READ ?
-						  "READ":"READA"),
-		(unsigned long long)bio->bi_sector,
-		(unsigned long long)data_sector,
-		(unsigned long long)offset, hash_number, bio->bi_size);
-
 	/* splitting bios is not yet implemented */
 	WARN_ON(bio->bi_size > sc->block_size);
 
@@ -1438,7 +1431,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			}
 		}
 		sio->nr = ++sc->nr_sio;
-		WPRINTK(sio, "hit %llu state %08lx/%08lx",
+		WPRINTK(sio, "%s hit %llu state %08lx/%08lx",
+			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
 		if (bio_data_dir(bio) == READ) {
@@ -1465,7 +1459,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			return DM_MAPIO_REQUEUE;
 		}
 		sio->nr = ++sc->nr_sio;
-		WPRINTK(sio, "miss %llu state %08lx/%08lx",
+		WPRINTK(sio, "%s: miss %llu state %08lx/%08lx",
+			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
 		if (bio_data_dir(bio) == READ) {
