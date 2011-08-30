@@ -44,11 +44,10 @@
 /* Caching modes */
 enum ssdcache_mode_t {
 	CACHE_IS_WRITETHROUGH,
-	CACHE_IS_WRITEMOST,
 	CACHE_IS_WRITEBACK,
 };
 
-static enum ssdcache_mode_t default_cache_mode = CACHE_IS_WRITEMOST;
+static enum ssdcache_mode_t default_cache_mode = CACHE_IS_WRITETHROUGH;
 
 struct ssdcache_md;
 struct ssdcache_io;
@@ -1556,8 +1555,6 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (argc >= 5) {
 		if (!strncmp(argv[4], "wb", 2)) {
 			sc->cache_mode = CACHE_IS_WRITEBACK;
-		} else if (!strncmp(argv[4], "wm", 2)) {
-			sc->cache_mode = CACHE_IS_WRITEMOST;
 		} else if (!strncmp(argv[4], "wt", 2)) {
 			sc->cache_mode = CACHE_IS_WRITETHROUGH;
 		} else {
@@ -1689,8 +1686,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			 sc->target_dev->name, sc->cache_dev->name,
 			 sc->block_size, sc->assoc,
 			 sc->cache_mode == CACHE_IS_WRITETHROUGH ?
-			 "wt" : sc->cache_mode == CACHE_IS_WRITEBACK ?
-			 "wb" : "wm");
+			 "wt" : "wb" );
 		break;
 	}
 	return 0;
