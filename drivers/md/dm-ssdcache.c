@@ -603,9 +603,7 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 	}
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
-		match += ((tmpstate == CTE_PREFETCH) ||
-			  (tmpstate == CTE_RESERVED) ||
-			  (tmpstate == CTE_UPDATE));
+		match += (tmpstate == CTE_UPDATE);
 		if (!bio || bio_data_dir(bio) == WRITE)
 			match += (tmpstate == CTE_WRITEBACK);
 	}
@@ -632,11 +630,7 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	if (!newcte)
 		return;
 
-	if (state == CTE_PREFETCH)
-		sio->bio_mask = cte_block_mask(sio->sc);
-	else
-		sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
-
+	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
 	newstate = sio_update_state(sio, oldstate, state);
 	WPRINTK(sio, "state %08lx:%08lx", oldstate, newstate);
 
@@ -1239,42 +1233,6 @@ static int read_from_target(struct ssdcache_io *sio, int pad)
 	return dm_io(&iorq, 1, &target, NULL);
 }
 
-#if 0
-static int copy_bvec_to_bio(struct ssdcache_io *sio, struct bio *bio)
-{
-	struct bio_vec *bvec;
-	int i, ret = 0;
-
-	dst_idx = bio->bi_idx;
-	dst_len = bio->bi_size;
-	src_bvec_size = 0;
-	dst_bvec_size = 0;
-	src_sector = sio->bvec_sector;
-	dst_sector = bio->bi_sector;
-	for (src_idx = 0; src_idx < sio->bvec_count; src_idx++) {
-		src_bvec = &sio->bvec[src_idx];
-		get_page(src_bvec->bv_page);
-		src_offset = to_sector(src_bvec->bv_offset + src_bvec->bv_len);
-		if (dst_sector < src_sector + src_offset) {
-			src_sector += src_offset;
-			continue;
-		}
-		src_addr = page_addres(src_bvec->bv_page);
-		dst_bvec = bio_iovec_idx(bio, dst_idx);
-		src_offset = to_bytes(dst_sector - src_sector) +
-			dst_bvec->bv_offset;
-
-		dst_addr = page_address(dst_bvec->bv_page);
-		dst_offset = dst_bvec->bv_offset;
-		memcpy(dst_addr + dst_offset, src_addr + src_offset, dst_len);
-		bvec_kunmap_irq(src_data, &flags);
-		dst_idx++;
-	}
-
-	return ret;
-}
-#endif
-
 static int do_io(struct ssdcache_io *sio)
 {
 	BUG_ON(sio->cte_idx < 0);
@@ -1447,24 +1405,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		/* Cache hit */
 		sc->cache_hits++;
 		if (cte_is_busy(sc, cte, bio)) {
-			if (bio_data_dir(bio) == READ) {
-				/* Bypass cache */
-				DPRINTK("%s: (cte %lx:%lx): bypass busy cte",
-					__FUNCTION__, sio->cmd->index,
-					sio->cte_idx);
-				sc->cache_bypassed++;
-				bio->bi_bdev = sc->target_dev->bdev;
-				ssdcache_destroy_sio(sio);
-				return DM_MAPIO_REMAPPED;
-			} else {
-				/* Transaction in progress, delay */
-				DPRINTK("%s: (cte %lx:%lx): delay cache hit",
-					__FUNCTION__, sio->cmd->index,
-					sio->cte_idx);
-				sc->cache_requeue++;
-				ssdcache_destroy_sio(sio);
-				return DM_MAPIO_REQUEUE;
-			}
+			/* Bypass cache */
+			DPRINTK("%s: (cte %lx:%lx): bypass busy cte",
+				__FUNCTION__, sio->cmd->index,
+				sio->cte_idx);
+			sc->cache_bypassed++;
+			bio->bi_bdev = sc->target_dev->bdev;
+			ssdcache_destroy_sio(sio);
+			return DM_MAPIO_REMAPPED;
 		}
 		sio->nr = ++sc->nr_sio;
 		WPRINTK(sio, "%s hit %llu state %08lx/%08lx",
@@ -1498,7 +1446,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			cte_bio_mask(sc, bio));
 		if (bio_data_dir(bio) == READ) {
 			cte_start_sequence(sio, CTE_PREFETCH);
-			res = read_from_target(sio, 1);
+			res = read_from_target(sio, 0);
 		} else if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
 			ssdcache_destroy_sio(sio);
