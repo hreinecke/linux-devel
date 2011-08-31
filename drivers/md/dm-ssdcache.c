@@ -91,6 +91,7 @@ struct ssdcache_c {
 
 struct ssdcache_io {
 	struct list_head list;
+	struct kref kref;
 	unsigned long nr;
 	struct ssdcache_c *sc;
 	struct ssdcache_md *cmd;
@@ -717,12 +718,15 @@ static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_c *sc)
 	memset(sio, 0, sizeof(struct ssdcache_io));
 	sio->sc = sc;
 	sio->cte_idx = -1;
+	kref_init(&sio->kref);
 	INIT_LIST_HEAD(&sio->list);
 	return sio;
 }
 
-static void ssdcache_destroy_sio(struct ssdcache_io *sio)
+static void ssdcache_destroy_sio(struct kref *kref)
 {
+	struct ssdcache_io *sio = container_of(kref, struct ssdcache_io, kref);
+
 	BUG_ON(!list_empty(&sio->list));
 
 	if (sio->bvec)
@@ -733,6 +737,16 @@ static void ssdcache_destroy_sio(struct ssdcache_io *sio)
 		__free_page(sio->pg_tail);
 
 	mempool_free(sio, _sio_pool);
+}
+
+static void ssdcache_get_sio(struct ssdcache_io *sio)
+{
+	kref_get(&sio->kref);
+}
+
+static int ssdcache_put_sio(struct ssdcache_io *sio)
+{
+	return kref_put(&sio->kref, ssdcache_destroy_sio);
 }
 
 static inline void push_sio(struct list_head *q, struct ssdcache_io *w)
@@ -831,7 +845,7 @@ static int finish_prefetch(struct ssdcache_io *sio, unsigned long error)
 		bio_endio(sio->bio, -EIO);
 		sio->bio = NULL;
 		sio->bio_mask = 0;
-		ssdcache_destroy_sio(sio);
+		ssdcache_put_sio(sio);
 		return 0;
 	}
 	/* Move to RESERVED */
@@ -893,7 +907,7 @@ static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
 
-	ssdcache_destroy_sio(sio);
+	ssdcache_put_sio(sio);
 	return 0;
 }
 
@@ -951,7 +965,7 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 	call_rcu(&oldcte->rcu, cte_reset);
 
 	if (!clone) {
-		ssdcache_destroy_sio(sio);
+		ssdcache_put_sio(sio);
 		sio = NULL;
 	}
 	return sio ? 1 : 0;
@@ -967,7 +981,7 @@ static int finish_nochange(struct ssdcache_io *sio, unsigned long error)
 	bio_endio(sio->bio, error ? -EIO : 0);
 	sio->bio = NULL;
 	/* Complete sio item */
-	ssdcache_destroy_sio(sio);
+	ssdcache_put_sio(sio);
 	return 0;
 }
 
@@ -1008,7 +1022,7 @@ static int finish_writeback(struct ssdcache_io *sio, unsigned long error)
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
 
-	ssdcache_destroy_sio(sio);
+	ssdcache_put_sio(sio);
 	return 0;
 }
 
@@ -1038,7 +1052,7 @@ static void io_callback(unsigned long error, void *context)
 			bio_endio(sio->bio, error?-EIO:0);
 			sio->bio = NULL;
 		}
-		ssdcache_destroy_sio(sio);
+		ssdcache_put_sio(sio);
 	}
 	if (requeue) {
 		ssdcache_schedule_sio(sio);
@@ -1241,7 +1255,7 @@ static int do_io(struct ssdcache_io *sio)
 		sio->bio = sio_fetch_writeback_bio(sio);
 		if (!sio->bio) {
 			WPRINTK(sio, "no bio");
-			ssdcache_destroy_sio(sio);
+			ssdcache_put_sio(sio);
 			return 0;
 		} else {
 			WPRINTK(sio, "fetch writeback bio");
@@ -1373,7 +1387,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		DPRINTK("sio creation failure");
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
-		ssdcache_destroy_sio(sio);
+		ssdcache_put_sio(sio);
 		return DM_MAPIO_REMAPPED;
 	}
 
@@ -1383,7 +1397,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		DPRINTK("cache insertion failure");
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
-		ssdcache_destroy_sio(sio);
+		ssdcache_put_sio(sio);
 		return DM_MAPIO_REMAPPED;
 	}
 
@@ -1392,7 +1406,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		DPRINTK("bypass cte sio");
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
-		ssdcache_destroy_sio(sio);
+		ssdcache_put_sio(sio);
 		return DM_MAPIO_REMAPPED;
 	}
 
@@ -1411,7 +1425,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 				sio->cte_idx);
 			sc->cache_bypassed++;
 			bio->bi_bdev = sc->target_dev->bdev;
-			ssdcache_destroy_sio(sio);
+			ssdcache_put_sio(sio);
 			return DM_MAPIO_REMAPPED;
 		}
 		sio->nr = ++sc->nr_sio;
@@ -1425,7 +1439,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		} else if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			sio_set_state(sio, CTE_INVALID);
 			bio->bi_bdev = sc->target_dev->bdev;
-			ssdcache_destroy_sio(sio);
+			ssdcache_put_sio(sio);
 			res = DM_MAPIO_REMAPPED;
 		} else {
 			cte_start_sequence(sio, CTE_UPDATE);
@@ -1436,7 +1450,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			DPRINTK("%s: (cte %lx:%lx): wait for writeback",
 				__FUNCTION__, sio->cmd->index, sio->cte_idx);
 			sc->cache_requeue++;
-			ssdcache_destroy_sio(sio);
+			ssdcache_put_sio(sio);
 			return DM_MAPIO_REQUEUE;
 		}
 		sio->nr = ++sc->nr_sio;
@@ -1449,7 +1463,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			res = read_from_target(sio, 0);
 		} else if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
-			ssdcache_destroy_sio(sio);
+			ssdcache_put_sio(sio);
 			return DM_MAPIO_REMAPPED;
 		} else {
 			cte_start_sequence(sio, CTE_UPDATE);
