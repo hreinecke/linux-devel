@@ -1153,93 +1153,23 @@ static int write_to_target(struct ssdcache_io *sio)
 	return dm_io(&iorq, 1, &target, NULL);
 }
 
-static int read_from_target(struct ssdcache_io *sio, int pad)
+static int read_from_target(struct ssdcache_io *sio)
 {
 	struct dm_io_region target;
 	struct dm_io_request iorq;
-	struct bio *bio = sio->bio;
-	struct bio_vec *bvec;
-	unsigned long offset, head, tail;
-	loff_t size;
-	int i, j, length, nr_vecs;
 
-	if (pad) {
-		/*
-		 * Pad I/O to cache blocksize
-		 */
-		offset = cte_bio_offset(sio->sc, bio);
-		head = to_bytes(offset);
-		tail = (bio->bi_size + head) % sio->sc->block_size;
-		size = i_size_read(sio->sc->target_dev->bdev->bd_inode);
-
-		if (to_bytes(bio->bi_sector) + bio->bi_size + tail > size) {
-			/* Padding beyond end of device */
-			tail = size - to_bytes(bio->bi_sector) - bio->bi_size;
-		}
-	} else {
-		head = tail = 0;
-	}
 	target.bdev = sio->sc->target_dev->bdev;
-	target.sector = bio->bi_sector - to_sector(head);
-	target.count = to_sector(bio->bi_size + head + tail);
+	target.sector = sio->bio->bi_sector;
+	target.count = to_sector(sio->bio->bi_size);
 
-	nr_vecs = bio->bi_vcnt - bio->bi_idx;
 	sio->bvec = NULL;
 	sio->pg_head = sio->pg_tail = NULL;
-	if (head) {
-		sio->pg_head = alloc_page(GFP_KERNEL);
-		if (!sio->pg_head) {
-			DMERR("read_from_target: no memory");
-			return ENOMEM;
-		}
-		nr_vecs++;
-	}
-	if (tail) {
-		sio->pg_tail = alloc_page(GFP_KERNEL);
-		if (!sio->pg_tail) {
-			DMERR("read_from_target: no memory");
-			if (sio->pg_head) {
-				kfree(sio->pg_head);
-				sio->pg_head = NULL;
-			}
-			return ENOMEM;
-		}
-		nr_vecs++;
-	}
 	sio->bvec_count = target.count;
 	sio->bvec_sector = target.sector;
-	if (head || tail) {
-		bvec = kmalloc(nr_vecs * sizeof(*bvec), GFP_NOIO);
-		if (!bvec) {
-			DMERR("read_from_target: no memory for bvec");
-			return ENOMEM;
-		}
-		i = 0;
-		if (head) {
-			bvec[i].bv_page = sio->pg_head;
-			bvec[i].bv_len = head;
-			bvec[i].bv_offset = 0;
-			i++;
-		}
-		length = bio->bi_size;
-		j = bio->bi_idx;
-		while (length) {
-			bvec[i] = bio->bi_io_vec[j];
-			length -= bvec[i].bv_len;
-			i++; j++;
-		}
-		if (tail) {
-			bvec[i].bv_page = sio->pg_tail;
-			bvec[i].bv_len = tail;
-			bvec[i].bv_offset = 0;
-		}
-		sio->bvec = bvec;
-	} else {
-		bvec = bio->bi_io_vec + bio->bi_idx;
-	}
+
 	iorq.bi_rw = READ;
 	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = bvec;
+	iorq.mem.ptr.bvec = sio->bio->bi_io_vec + sio->bio->bi_idx;
 	iorq.notify.fn = io_callback;
 	iorq.notify.context = sio;
 	iorq.client = sio->sc->iocp;
@@ -1460,7 +1390,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			cte_bio_mask(sc, bio));
 		if (bio_data_dir(bio) == READ) {
 			cte_start_sequence(sio, CTE_PREFETCH);
-			res = read_from_target(sio, 0);
+			res = read_from_target(sio);
 		} else if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
 			ssdcache_put_sio(sio);
