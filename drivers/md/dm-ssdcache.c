@@ -509,9 +509,10 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 
 static unsigned long sio_get_state(struct ssdcache_io *sio)
 {
-	unsigned long state = 0x11111111UL;
+	unsigned long state;
 	struct ssdcache_te *cte;
 
+	memset(&state, 0x11, sizeof(unsigned long));
 	rcu_read_lock();
 	if (sio && sio->cte_idx >= 0) {
 		cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
@@ -534,16 +535,14 @@ static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 	oldstate = sio_get_state(sio);
 	tmpstate = state | (state << 4);
 	memset(&newstate, tmpstate, sizeof(unsigned long));
-	WPRINTK(sio, "state %08lx:%08lx %08lx", oldstate, newstate,
-		sio->bio_mask);
+
 	return ((oldstate & sio->bio_mask) == (newstate & sio->bio_mask));
 }
 
 static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 {
 	struct ssdcache_te *oldcte, *newcte = NULL;
-	unsigned long newstate, oldstate, flags, state_shift;
-	int i, match = 0;
+	unsigned long newstate, oldstate, tmpstate, flags;
 
 	if (!sio || sio->cte_idx < 0)
 		return;
@@ -552,12 +551,10 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	newstate = sio_update_state(sio, oldstate, state);
 
 	/* Check if we should drop the old cte */
-	for (i = 0; i < to_sector(sio->sc->block_size); i++) {
-		state_shift = (i * 4);
-		if (((newstate >> state_shift) & 0xF) == CTE_INVALID)
-			match++;
-	}
-	if (match < to_sector(sio->sc->block_size)) {
+	memset(&tmpstate, 0x11, sizeof(unsigned long));
+	tmpstate &= sio->sc->block_mask;
+
+	if ((newstate & sio->sc->block_mask) != tmpstate ) {
 		/* cte still valid */
 		newcte = mempool_alloc(_cte_pool, GFP_NOWAIT | __GFP_ZERO);
 		if (!newcte)
