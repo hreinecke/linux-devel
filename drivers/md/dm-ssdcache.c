@@ -39,7 +39,7 @@
 #define DEFAULT_CTE_NUM 4096
 
 #define DEFAULT_BLOCKSIZE	4096
-#define DEFAULT_ASSOCIATIVITY	8
+#define DEFAULT_ASSOCIATIVITY	16
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -47,7 +47,14 @@ enum ssdcache_mode_t {
 	CACHE_IS_WRITEBACK,
 };
 
+/* Caching strategies */
+enum ssdcache_strategy_t {
+	CACHE_LRU,
+	CACHE_LFU,
+};
+
 static enum ssdcache_mode_t default_cache_mode = CACHE_IS_WRITETHROUGH;
+static enum ssdcache_strategy_t default_cache_strategy = CACHE_LFU;
 
 struct ssdcache_md;
 struct ssdcache_io;
@@ -55,6 +62,7 @@ struct ssdcache_io;
 struct ssdcache_te {
 	unsigned long index;	/* Offset within table entry block */
 	unsigned long atime;	/* Timestamp of the block's last access */
+	unsigned long count;    /* Number of accesses */
 	unsigned long state;    /* State bitmap */
 	sector_t sector;	/* Sector number on target device */
 	struct ssdcache_md *md; /* Backlink to metadirectory */
@@ -84,6 +92,7 @@ struct ssdcache_c {
 	unsigned int assoc;
 	unsigned long nr_sio;
 	enum ssdcache_mode_t cache_mode;
+	enum ssdcache_strategy_t cache_strategy;
 	unsigned long cache_hits;
 	unsigned long cache_bypassed;
 	unsigned long cache_evictions;
@@ -331,6 +340,7 @@ struct ssdcache_te * cte_new(struct ssdcache_c *sc, struct ssdcache_md *cmd,
 
 	newcte->index = index;
 	newcte->atime = jiffies;
+	newcte->count = 1;
 	for (i = 0; i < to_sector(sc->block_size); i++)
 		newstate |= (unsigned long)CTE_INVALID << (i * 4);
 	newcte->state = newstate;
@@ -566,6 +576,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 		*newcte = *oldcte;
 		newcte->state = newstate;
 		newcte->atime = jiffies;
+		newcte->count++;
 	}
 	rcu_assign_pointer(sio->cmd->te[oldcte->index], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
@@ -630,6 +641,7 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	newcte->sector = cte_bio_align(sio->sc, sio->bio);
 	newcte->state = newstate;
 	newcte->atime = jiffies;
+	newcte->count++;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
@@ -668,6 +680,7 @@ static void cte_restart_sequence(struct ssdcache_io *sio)
 	oldcte = sio->cmd->te[sio->cte_idx];
 	*newcte = *oldcte;
 	newcte->atime = jiffies;
+	newcte->count++;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
@@ -1017,10 +1030,12 @@ static int cte_match(struct ssdcache_c *sc,
 	sector_t data_sector;
 	struct ssdcache_te *cte;
 	unsigned long cte_atime, clean_atime, oldest_atime, flags;
+	unsigned long cte_count, clean_count, oldest_count;
 	int invalid = -1, clean, oldest, i, busy = 0;
 
 	data_sector = cte_bio_align(sc, bio);
 	clean_atime = oldest_atime = jiffies;
+	clean_count = oldest_count = -1;
 	clean = oldest = -1;
 	for (i = 0; i < cmd->num_cte; i++) {
 		cte = cmd->te[i];
@@ -1039,18 +1054,32 @@ static int cte_match(struct ssdcache_c *sc,
 			busy++;
 			continue;
 		}
-
-		/* Select the oldest clean entry */
-		rcu_read_lock();
-		cte_atime = rcu_dereference(cte)->atime;
-		rcu_read_unlock();
-		if (cte_is_state(sc, cte, bio, CTE_CLEAN) &&
-		    time_before_eq(cte_atime, clean_atime)) {
-			clean_atime = cte_atime;
-			clean = i;
-		} else if (time_before_eq(cte_atime, oldest_atime)) {
-			oldest_atime = cte_atime;
-			oldest = i;
+		if (sc->cache_strategy == CACHE_LRU) {
+			/* Select the oldest clean entry */
+			rcu_read_lock();
+			cte_atime = rcu_dereference(cte)->atime;
+			rcu_read_unlock();
+			if (cte_is_state(sc, cte, bio, CTE_CLEAN) &&
+			    time_before_eq(cte_atime, clean_atime)) {
+				clean_atime = cte_atime;
+				clean = i;
+			} else if (time_before_eq(cte_atime, oldest_atime)) {
+				oldest_atime = cte_atime;
+				oldest = i;
+			}
+		} else {
+			/* Select the lowest access count */
+			rcu_read_lock();
+			cte_count = rcu_dereference(cte)->count;
+			rcu_read_unlock();
+			if (cte_is_state(sc, cte, bio, CTE_CLEAN) &&
+			    cte_count <= clean_count) {
+				clean_count = cte_count;
+				clean = i;
+			} else if (cte_count <= oldest_count) {
+				oldest_count = cte_count;
+				oldest = i;
+			}
 		}
 	}
 
@@ -1333,6 +1362,8 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	} else {
 		sc->cache_mode = default_cache_mode;
 	}
+
+	sc->cache_strategy = default_cache_strategy;
 
 	sc->iocp = dm_io_client_create();
 	if (IS_ERR(sc->iocp)) {
