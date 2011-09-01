@@ -306,8 +306,7 @@ static unsigned long cte_bio_mask(struct ssdcache_c *sc, struct bio *bio)
 	unsigned long mask = 0;
 	int i;
 
-	if (!bio)
-		return 0;
+	BUG_ON(!bio);
 
 	for (i = 0; i < to_sector(sc->block_size); i++) {
 		if (i >= cte_bio_offset(sc, bio) &&
@@ -598,7 +597,9 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 	}
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
-		match += (tmpstate == CTE_UPDATE);
+		match += ((tmpstate == CTE_UPDATE) ||
+			  (tmpstate == CTE_PREFETCH) ||
+			  (tmpstate == CTE_RESERVED));
 		if (!bio || bio_data_dir(bio) == WRITE)
 			match += (tmpstate == CTE_WRITEBACK);
 	}
@@ -712,6 +713,7 @@ static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_c *sc)
 	memset(sio, 0, sizeof(struct ssdcache_io));
 	sio->sc = sc;
 	sio->cte_idx = -1;
+	sio->nr = ++sc->nr_sio;
 	kref_init(&sio->kref);
 	INIT_LIST_HEAD(&sio->list);
 	return sio;
@@ -822,26 +824,16 @@ static struct bio * sio_fetch_writeback_bio(struct ssdcache_io *sio)
 static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 {
 	int i;
-	struct ssdcache_te *oldcte, *newcte;
 	struct bio_vec *bvec;
-	enum cte_state state;
-	unsigned long oldstate, newstate, flags;
-
-	oldstate = sio_get_state(sio);
-
-	newcte = mempool_alloc(_cte_pool, GFP_NOWAIT | __GFP_ZERO);
-	if (!newcte)
-		return 1;
 
 	if (error) {
 		WPRINTK(sio, "error, mark cte invalid");
-		state = CTE_INVALID;
+		sio_set_state(sio, CTE_INVALID);
 	} else {
 		WPRINTK(sio, "mark cte clean");
-		state = CTE_CLEAN;
+		sio_set_state(sio, CTE_CLEAN);
 	}
 
-	newstate = sio_update_state(sio, oldstate, state);
 	if (sio->bio) {
 		/* Release bio */
 		bio_for_each_segment(bvec, sio->bio, i)
@@ -849,15 +841,6 @@ static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 		bio_put(sio->bio);
 		sio->bio = NULL;
 	}
-	spin_lock_irqsave(&sio->cmd->lock, flags);
-	oldcte = sio->cmd->te[sio->cte_idx];
-
-	*newcte = *oldcte;
-	newcte->state = newstate;
-	newcte->atime = jiffies;
-	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irqrestore(&sio->cmd->lock, flags);
-	call_rcu(&oldcte->rcu, cte_reset);
 
 	ssdcache_put_sio(sio);
 	return 0;
@@ -873,47 +856,27 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 		WPRINTK(sio, "mark cte writeback");
 		sio_set_state(sio, CTE_WRITEBACK);
 	}
+	if (sio->bio) {
+		bio_put(sio->bio);
+		sio->bio = NULL;
+	}
 	ssdcache_put_sio(sio);
 	return 0;
 }
 
 static int finish_writeback(struct ssdcache_io *sio, unsigned long error)
 {
-	int i;
-	struct ssdcache_te *oldcte, *newcte;
-	struct bio_vec *bvec;
-	enum cte_state state;
-	unsigned long oldstate, newstate, flags;
-
-	oldstate = sio_get_state(sio);
-
-	newcte = mempool_alloc(_cte_pool, GFP_NOWAIT | __GFP_ZERO);
-	if (!newcte)
-		return 1;
-
 	if (error) {
-		WPRINTK(sio, "error, mark cte dirty");
-		state = CTE_DIRTY;
+		WPRINTK(sio, "error, mark cte invalid");
+		sio_set_state(sio, CTE_INVALID);
 	} else {
 		WPRINTK(sio, "mark cte clean");
-		state = CTE_CLEAN;
+		sio_set_state(sio, CTE_CLEAN);
 	}
-
-	newstate = sio_update_state(sio, oldstate, state);
-	/* Release bio */
-	bio_for_each_segment(bvec, sio->bio, i)
-		put_page(bvec->bv_page);
-	bio_put(sio->bio);
-
-	spin_lock_irqsave(&sio->cmd->lock, flags);
-	oldcte = sio->cmd->te[sio->cte_idx];
-	*newcte = *oldcte;
-	newcte->state = newstate;
-	newcte->atime = jiffies;
-	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irqrestore(&sio->cmd->lock, flags);
-	call_rcu(&oldcte->rcu, cte_reset);
-
+	if (sio->bio) {
+		bio_put(sio->bio);
+		sio->bio = NULL;
+	}
 	ssdcache_put_sio(sio);
 	return 0;
 }
@@ -933,12 +896,14 @@ static void io_callback(unsigned long error, void *context)
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
 		requeue = finish_writeback(sio, error);
 	} else if (sio_is_state(sio, CTE_INVALID)) {
+		if (sio->bio)
+			bio_put(sio->bio);
 		ssdcache_put_sio(sio);
 	} else {
 		WPRINTK(sio, "unhandled state %08lx",
 			sio_get_state(sio));
 		if (sio->bio) {
-			bio_endio(sio->bio, error ? -EIO : 0);
+			bio_put(sio->bio);
 			sio->bio = NULL;
 		}
 		ssdcache_put_sio(sio);
@@ -1222,22 +1187,19 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	if (cte_match_sector(sc, cte, bio)) {
 		/* Cache hit */
 		sc->cache_hits++;
+		WPRINTK(sio, "%s hit %llu state %08lx/%08lx",
+			bio_data_dir(bio) == READ ? "read" : "write",
+			(unsigned long long)data_sector, state,
+			cte_bio_mask(sc, bio));
 		if (cte_is_busy(sc, cte, bio)) {
 			/* Bypass cache */
-			DPRINTK("%s: (cte %lx:%lx): bypass busy cte",
-				__FUNCTION__, sio->cmd->index,
-				sio->cte_idx);
+			WPRINTK(sio, "bypass busy cte");
 			sc->cache_bypassed++;
 			bio->bi_bdev = sc->target_dev->bdev;
 			ssdcache_put_sio(sio);
 			map_context->ptr = NULL;
 			return DM_MAPIO_REMAPPED;
 		}
-		sio->nr = ++sc->nr_sio;
-		WPRINTK(sio, "%s hit %llu state %08lx/%08lx",
-			bio_data_dir(bio) == READ ? "read" : "write",
-			(unsigned long long)data_sector, state,
-			cte_bio_mask(sc, bio));
 		if (bio_data_dir(bio) == READ) {
 			cte_restart_sequence(sio);
 			bio->bi_bdev = sc->cache_dev->bdev;
@@ -1260,22 +1222,19 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		}
 		res = DM_MAPIO_REMAPPED;
 	} else {
-		sio->nr = ++sc->nr_sio;
 		WPRINTK(sio, "%s: miss %llu state %08lx/%08lx",
 			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
+		bio_get(bio);
+		map_context->ptr = sio;
+		ssdcache_get_sio(sio);
 		if (bio_data_dir(bio) == READ) {
 			cte_start_sequence(sio, CTE_PREFETCH);
 			bio->bi_bdev = sc->target_dev->bdev;
-			map_context->ptr = sio;
-			bio_get(bio);
 			return DM_MAPIO_REMAPPED;
 		}
 		cte_start_sequence(sio, CTE_UPDATE);
-		map_context->ptr = sio;
-		ssdcache_get_sio(sio);
-		bio_get(bio);
 		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
 			write_to_cache(sio);
@@ -1323,23 +1282,18 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		return 0;
 	} else if (sio_is_state(sio, CTE_UPDATE)) {
 		/* Direct write completed, indirect write still in flight */
-		sio_set_state(sio, CTE_RESERVED);
+		sio_set_state(sio, CTE_WRITEBACK);
 		WPRINTK(sio, "waiting for indirect write to complete");
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
 		/* Direct and indirect write completed */
 		WPRINTK(sio, "mark cte clean");
 		sio_set_state(sio, CTE_CLEAN);
-	} else if (!sio_is_state(sio, CTE_CLEAN) &&
-		   !sio_is_state(sio, CTE_DIRTY)) {
+	} else if (!sio_is_state(sio, CTE_CLEAN)) {
 		WPRINTK(sio, "unhandled state %08lx",
 			sio_get_state(sio));
 	}
 
 finish:
-	if (sio->bio) {
-		bio_put(sio->bio);
-		sio->bio = NULL;
-	}
 	ssdcache_put_sio(sio);
 
 	return 0;
