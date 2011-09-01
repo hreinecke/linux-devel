@@ -1006,6 +1006,7 @@ static int do_io(struct ssdcache_io *sio)
 /*
  * Cache lookup and I/O handling
  */
+#if 0
 static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 {
 	unsigned long value, hash_number, offset, hash_mask, sector_shift;
@@ -1017,6 +1018,18 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 	hash_number = (unsigned long)hash_64(value, sc->hash_bits - sc->hash_shift);
 
 	return (hash_number << sc->hash_shift) | offset;
+}
+#endif
+
+static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
+{
+	unsigned long sector_shift, value, hash_mask;
+
+	sector_shift = fls(sc->block_size/ 512) - 1;
+	value = sector >> (sc->hash_shift + sector_shift);
+	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
+
+	return value & hash_mask;
 }
 
 static int cte_match(struct ssdcache_c *sc,
