@@ -25,7 +25,7 @@
 #define DPRINTK( s, arg... ) printk(DM_MSG_PREFIX s "\n", ##arg)
 #define WPRINTK( w, s, arg... ) printk(DM_MSG_PREFIX "%lu: %s (cte %lx:%lx): "\
 				       s "\n", (w)->nr, __FUNCTION__, \
-				       (w)->cmd->index, \
+				       (w)->cmd->hash, \
 				       (w)->cte_idx, ##arg)
 #else
 #define DPRINTK( s, arg... )
@@ -78,7 +78,7 @@ struct ssdcache_te {
 
 struct ssdcache_md {
 	spinlock_t lock;	/* Lock to protect operations on the bio list */
-	unsigned long index;	/* Hash number */
+	unsigned long hash;	/* Hash number */
 	unsigned int num_cte;	/* Number of table entries */
 	unsigned long atime;
 	struct ssdcache_te *te[DEFAULT_ASSOCIATIVITY];	/* RCU Table entries */
@@ -258,7 +258,7 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
 	cmd = mempool_alloc(_cmd_pool, GFP_NOIO | __GFP_ZERO);
 	if (!cmd)
 		return NULL;
-	cmd->index = hash_number;
+	cmd->hash = hash_number;
 	cmd->num_cte = (1UL << sc->hash_shift) * DEFAULT_ASSOCIATIVITY;
 	spin_lock_init(&cmd->lock);
 	cmd->atime = jiffies;
@@ -273,7 +273,7 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
 		mempool_free(cmd, _cmd_pool);
 		cmd = radix_tree_lookup(&sc->md_tree, hash_number);
 		BUG_ON(!cmd);
-		BUG_ON(cmd->index != hash_number);
+		BUG_ON(cmd->hash != hash_number);
 	}
 	spin_unlock_irqrestore(&sc->cmd_lock, flags);
 
@@ -933,7 +933,7 @@ static inline sector_t to_cache_sector(struct ssdcache_io *sio,
 	sector_offset = data_sector & sio->sc->block_mask;
 
 	cte_offset = to_sector(sio->cte_idx * sio->sc->block_size);
-	cmd_offset = to_sector(sio->cmd->index * sio->cmd->num_cte * sio->sc->block_size);
+	cmd_offset = to_sector(sio->cmd->hash * sio->cmd->num_cte * sio->sc->block_size);
 	cache_sector = sio->sc->data_offset + cmd_offset + cte_offset + sector_offset;
 
 	return cache_sector;
@@ -1114,7 +1114,7 @@ static int cte_match(struct ssdcache_c *sc,
 
 	if (clean != -1) {
 		DPRINTK("%s (cte %lx:%x): drop clean cte", __FUNCTION__,
-			cmd->index, clean);
+			cmd->hash, clean);
 		for (i = 0; i < cmd->num_cte; i++) {
 			sector_t cte_sector;
 			unsigned long cte_state;
@@ -1128,11 +1128,11 @@ static int cte_match(struct ssdcache_c *sc,
 				rcu_read_unlock();
 				DPRINTK("%s (cte %lx:%x): sector %lx "
 					"state %08lx count %ld",
-					__FUNCTION__, cmd->index, i,
+					__FUNCTION__, cmd->hash, i,
 					cte_sector, cte_state, cte_count);
 			} else {
 				DPRINTK("%s (cte %lx:%x): unassigned",
-					__FUNCTION__, cmd->index, i);
+					__FUNCTION__, cmd->hash, i);
 			}
 		}
 		spin_lock_irqsave(&cmd->lock, flags);
@@ -1146,7 +1146,7 @@ static int cte_match(struct ssdcache_c *sc,
 
 	if (oldest != -1) {
 		DPRINTK("%s (cte %lx:%x): drop oldest cte, %d/%d ctes busy",
-			__FUNCTION__, cmd->index, oldest, busy, i);
+			__FUNCTION__, cmd->hash, oldest, busy, i);
 		spin_lock_irqsave(&cmd->lock, flags);
 		cte = cmd->te[oldest];
 		rcu_assign_pointer(cmd->te[oldest], NULL);
@@ -1157,7 +1157,7 @@ static int cte_match(struct ssdcache_c *sc,
 	}
 
 	DPRINTK("%s (cte %lx:%x): %d ctes busy", __FUNCTION__,
-		cmd->index, -1, busy);
+		cmd->hash, -1, busy);
 	return -1;
 }
 
@@ -1470,7 +1470,7 @@ static void ssdcache_dtr(struct dm_target *ti)
 						 (void **)cmds, pos,
 						 MIN_CMD_NUM);
 		for (i = 0; i < nr_cmds; i++) {
-			pos = cmds[i]->index;
+			pos = cmds[i]->hash;
 			cmd = radix_tree_delete(&sc->md_tree, pos);
 			spin_lock_irqsave(&cmd->lock, flags);
 			for (j = 0; j < cmd->num_cte; j++) {
@@ -1510,7 +1510,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 						 MIN_CMD_NUM);
 		for (i = 0; i < nr_elems; i++) {
 			cmd = cmds[i];
-			pos = cmd->index;
+			pos = cmd->hash;
 			nr_cmds++;
 			for (j = 0; j < cmd->num_cte; j++) {
 				if (cmd->te[j])
