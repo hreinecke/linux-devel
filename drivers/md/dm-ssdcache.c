@@ -623,7 +623,6 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 
 	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
 	newstate = sio_update_state(sio, oldstate, state);
-	WPRINTK(sio, "state %08lx:%08lx", oldstate, newstate);
 
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
@@ -1216,7 +1215,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 			  int error, union map_info *map_context)
 {
-	struct ssdcache_c *sc = ti->private;
 	struct ssdcache_io *sio = map_context->ptr;
 	struct bio *clone = NULL;
 	struct bio_vec *bvec;
