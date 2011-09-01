@@ -1013,10 +1013,11 @@ static int do_io(struct ssdcache_io *sio)
  */
 static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 {
-	unsigned long value, hash_number, offset, hash_mask;
+	unsigned long value, hash_number, offset, hash_mask, sector_shift;
 
+	sector_shift = fls(sc->block_size / 512) - 1;
 	hash_mask = (1UL << sc->hash_shift) - 1;
-	value = sector >> sc->hash_shift;
+	value = sector >> (sc->hash_shift + sector_shift);
 	offset = sector & hash_mask;
 	hash_number = (unsigned long)hash_64(value, sc->hash_bits - sc->hash_shift);
 
