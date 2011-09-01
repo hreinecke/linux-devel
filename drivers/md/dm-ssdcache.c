@@ -691,20 +691,15 @@ static inline bool cte_match_sector(struct ssdcache_c *sc,
 				    struct bio *bio)
 {
 	bool match = false;
-	unsigned long oldstate, tmpstate, bio_mask;
 	sector_t sector;
 
 	if (!cte)
 		return match;
 
-	memset(&tmpstate, 0x11, sizeof(unsigned long));
-	bio_mask = cte_bio_mask(sc, bio);
 	rcu_read_lock();
 	sector = rcu_dereference(cte)->sector;
-	oldstate = rcu_dereference(cte)->state;
 	rcu_read_unlock();
-	if ((oldstate & bio_mask) != (tmpstate & bio_mask))
-		match = (cte_bio_align(sc, bio) == sector);
+	match = (cte_bio_align(sc, bio) == sector);
 
 	return match;
 }
