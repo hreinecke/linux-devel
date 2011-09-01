@@ -86,6 +86,7 @@ struct ssdcache_c {
 	enum ssdcache_mode_t cache_mode;
 	unsigned long cache_hits;
 	unsigned long cache_bypassed;
+	unsigned long cache_evictions;
 };
 
 struct ssdcache_io {
@@ -824,7 +825,6 @@ static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 		WPRINTK(sio, "error, mark cte invalid");
 		sio_set_state(sio, CTE_INVALID);
 	} else {
-		WPRINTK(sio, "mark cte clean");
 		sio_set_state(sio, CTE_CLEAN);
 	}
 
@@ -847,7 +847,6 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 		WPRINTK(sio, "error, mark cte invalid");
 		sio_set_state(sio, CTE_INVALID);
 	} else {
-		WPRINTK(sio, "mark cte writeback");
 		sio_set_state(sio, CTE_WRITEBACK);
 	}
 	if (sio->bio) {
@@ -864,7 +863,6 @@ static int finish_writeback(struct ssdcache_io *sio, unsigned long error)
 		WPRINTK(sio, "error, mark cte invalid");
 		sio_set_state(sio, CTE_INVALID);
 	} else {
-		WPRINTK(sio, "mark cte clean");
 		sio_set_state(sio, CTE_CLEAN);
 	}
 	if (sio->bio) {
@@ -1018,7 +1016,7 @@ static int cte_match(struct ssdcache_c *sc,
 {
 	sector_t data_sector;
 	struct ssdcache_te *cte;
-	unsigned long cte_atime, clean_atime, oldest_atime;
+	unsigned long cte_atime, clean_atime, oldest_atime, flags;
 	int invalid = -1, clean, oldest, i, busy = 0;
 
 	data_sector = cte_bio_align(sc, bio);
@@ -1060,14 +1058,26 @@ static int cte_match(struct ssdcache_c *sc,
 		return invalid;
 
 	if (clean != -1) {
-		DPRINTK("%s (cte %lx:%x): Use clean", __FUNCTION__,
+		DPRINTK("%s (cte %lx:%x): drop clean cte", __FUNCTION__,
 			cmd->index, clean);
+		spin_lock_irqsave(&cmd->lock, flags);
+		cte = cmd->te[clean];
+		rcu_assign_pointer(cmd->te[clean], NULL);
+		spin_unlock_irqrestore(&cmd->lock, flags);
+		call_rcu(&cte->rcu, cte_reset);
+		sc->cache_evictions++;
 		return clean;
 	}
 
 	if (oldest != -1) {
-		DPRINTK("%s (cte %lx:%x): Use oldest, %d/%d ctes busy",
+		DPRINTK("%s (cte %lx:%x): drop oldest cte, %d/%d ctes busy",
 			__FUNCTION__, cmd->index, oldest, busy, i);
+		spin_lock_irqsave(&cmd->lock, flags);
+		cte = cmd->te[oldest];
+		rcu_assign_pointer(cmd->te[oldest], NULL);
+		spin_unlock_irqrestore(&cmd->lock, flags);
+		call_rcu(&cte->rcu, cte_reset);
+		sc->cache_evictions++;
 		return oldest;
 	}
 
@@ -1223,7 +1233,6 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 
 	if (sio_is_state(sio, CTE_PREFETCH)) {
 		/* Move to RESERVED */
-		WPRINTK(sio, "mark cte reserved");
 		sio_set_state(sio, CTE_RESERVED);
 		/* Setup clone for writing to cache device */
 		WPRINTK(sio, "write to cache device");
@@ -1241,7 +1250,6 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		WPRINTK(sio, "waiting for indirect write to complete");
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
 		/* Direct and indirect write completed */
-		WPRINTK(sio, "mark cte clean");
 		sio_set_state(sio, CTE_CLEAN);
 	} else if (!sio_is_state(sio, CTE_CLEAN)) {
 		WPRINTK(sio, "unhandled state %08lx",
@@ -1437,11 +1445,11 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	switch (type) {
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
-			 "cache %lu/%lu/%lu",
+			 "cache %lu/%lu/%lu/%lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * sc->assoc,
 			 sc->nr_sio, sc->cache_hits,
-			 sc->cache_bypassed);
+			 sc->cache_bypassed, sc->cache_evictions);
 		break;
 
 	case STATUSTYPE_TABLE:
