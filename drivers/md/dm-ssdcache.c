@@ -943,26 +943,6 @@ static void write_to_cache(struct ssdcache_io *sio)
 	dm_io(&iorq, 1, &cache, NULL);
 }
 
-static void read_from_cache(struct ssdcache_io *sio)
-{
-	struct dm_io_region cache;
-	struct dm_io_request iorq;
-	struct bio *bio = sio->bio;
-
-	cache.bdev = sio->sc->cache_dev->bdev;
-	cache.sector = to_cache_sector(sio, bio->bi_sector);
-	cache.count = to_sector(bio->bi_size);
-
-	iorq.bi_rw = READ;
-	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx;
-	iorq.notify.fn = io_callback;
-	iorq.notify.context = sio;
-	iorq.client = sio->sc->iocp;
-
-	dm_io(&iorq, 1, &cache, NULL);
-}
-
 static void write_to_target(struct ssdcache_io *sio)
 {
 	struct dm_io_region target;
@@ -973,25 +953,6 @@ static void write_to_target(struct ssdcache_io *sio)
 	target.count = to_sector(sio->bio->bi_size);
 
 	iorq.bi_rw = WRITE;
-	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = sio->bio->bi_io_vec + sio->bio->bi_idx;
-	iorq.notify.fn = io_callback;
-	iorq.notify.context = sio;
-	iorq.client = sio->sc->iocp;
-
-	dm_io(&iorq, 1, &target, NULL);
-}
-
-static void read_from_target(struct ssdcache_io *sio)
-{
-	struct dm_io_region target;
-	struct dm_io_request iorq;
-
-	target.bdev = sio->sc->target_dev->bdev;
-	target.sector = sio->bio->bi_sector;
-	target.count = to_sector(sio->bio->bi_size);
-
-	iorq.bi_rw = READ;
 	iorq.mem.type = DM_IO_BVEC;
 	iorq.mem.ptr.bvec = sio->bio->bi_io_vec + sio->bio->bi_idx;
 	iorq.notify.fn = io_callback;
