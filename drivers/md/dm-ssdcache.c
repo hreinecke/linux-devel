@@ -525,20 +525,18 @@ static unsigned long sio_get_state(struct ssdcache_io *sio)
 
 static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 {
-	unsigned long oldstate, offset;
-	enum cte_state tmpstate = CTE_INVALID;
-	int match = 0, i;
+	unsigned long oldstate, newstate;
+	unsigned char tmpstate;
 
-	if (!sio || !sio->bio || sio->cte_idx < 0)
+	if (!sio)
 		return false;
 
 	oldstate = sio_get_state(sio);
-	offset= cte_bio_offset(sio->sc, sio->bio);
-	for (i = 0; i < to_sector(sio->bio->bi_size); i++) {
-		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
-		match += (tmpstate == state);
-	}
-	return (match == to_sector(sio->bio->bi_size));
+	tmpstate = state | (state << 4);
+	memset(&newstate, tmpstate, sizeof(unsigned long));
+	WPRINTK(sio, "state %08lx:%08lx %08lx", oldstate, newstate,
+		sio->bio_mask);
+	return ((oldstate & sio->bio_mask) == (newstate & sio->bio_mask));
 }
 
 static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
