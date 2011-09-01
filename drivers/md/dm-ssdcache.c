@@ -696,15 +696,20 @@ static inline bool cte_match_sector(struct ssdcache_c *sc,
 				    struct bio *bio)
 {
 	bool match = false;
+	unsigned long oldstate, tmpstate, bio_mask;
 	sector_t sector;
 
 	if (!cte)
 		return match;
 
+	memset(&tmpstate, 0x11, sizeof(unsigned long));
+	bio_mask = cte_bio_mask(sc, bio);
 	rcu_read_lock();
 	sector = rcu_dereference(cte)->sector;
+	oldstate = rcu_dereference(cte)->state;
 	rcu_read_unlock();
-	match = (cte_bio_align(sc, bio) == sector);
+	if ((oldstate & bio_mask) != (tmpstate & bio_mask))
+		match = (cte_bio_align(sc, bio) == sector);
 
 	return match;
 }
@@ -1110,6 +1115,26 @@ static int cte_match(struct ssdcache_c *sc,
 	if (clean != -1) {
 		DPRINTK("%s (cte %lx:%x): drop clean cte", __FUNCTION__,
 			cmd->index, clean);
+		for (i = 0; i < cmd->num_cte; i++) {
+			sector_t cte_sector;
+			unsigned long cte_state;
+
+			cte = cmd->te[i];
+			if (cte) {
+				rcu_read_lock();
+				cte_count = rcu_dereference(cte)->count;
+				cte_sector = rcu_dereference(cte)->sector;
+				cte_state = rcu_dereference(cte)->state;
+				rcu_read_unlock();
+				DPRINTK("%s (cte %lx:%x): sector %lx "
+					"state %08lx count %ld",
+					__FUNCTION__, cmd->index, i,
+					cte_sector, cte_state, cte_count);
+			} else {
+				DPRINTK("%s (cte %lx:%x): unassigned",
+					__FUNCTION__, cmd->index, i);
+			}
+		}
 		spin_lock_irqsave(&cmd->lock, flags);
 		cte = cmd->te[clean];
 		rcu_assign_pointer(cmd->te[clean], NULL);
