@@ -39,7 +39,7 @@
 #define DEFAULT_CTE_NUM 4096
 
 #define DEFAULT_BLOCKSIZE	4096
-#define DEFAULT_ASSOCIATIVITY	16
+#define DEFAULT_ASSOCIATIVITY	8
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -1222,12 +1222,12 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			cte_bio_mask(sc, bio));
 		bio_get(bio);
 		map_context->ptr = sio;
-		ssdcache_get_sio(sio);
 		if (bio_data_dir(bio) == READ) {
 			cte_start_sequence(sio, CTE_PREFETCH);
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
+		ssdcache_get_sio(sio);
 		cte_start_sequence(sio, CTE_UPDATE);
 		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
