@@ -147,7 +147,7 @@ static int do_io(struct ssdcache_io *sio);
 
 static int pool_init(void)
 {
-	_sio_cache = kmem_cache_create("ssdcache-work",
+	_sio_cache = kmem_cache_create("ssdcache-sio",
 					sizeof(struct ssdcache_io),
 					__alignof__(struct ssdcache_io),
 					0, NULL);
@@ -678,17 +678,20 @@ static inline bool cte_match_sector(struct ssdcache_c *sc,
 				    struct bio *bio)
 {
 	bool match = false;
+	unsigned long oldstate, tmpstate, bio_mask;
 	sector_t sector;
 
 	if (!cte)
 		return match;
 
+	memset(&tmpstate, 0x11, sizeof(unsigned long));
+	bio_mask = cte_bio_mask(sc, bio);
 	rcu_read_lock();
 	sector = rcu_dereference(cte)->sector;
+	oldstate = rcu_dereference(cte)->state;
 	rcu_read_unlock();
-	if (!cte_is_state(sc, cte, bio, CTE_INVALID)) {
+	if ((oldstate & bio_mask) != (tmpstate & bio_mask))
 		match = (cte_bio_align(sc, bio) == sector);
-	}
 
 	return match;
 }
@@ -786,8 +789,6 @@ static void do_sio(struct work_struct *ignored)
 		items = process_sio(&_io_work, do_io);
 		if (list_empty(&_io_work))
 			empty++;
-		DPRINTK("do_sio: %d items dequeued, %d queues empty",
-			items, empty);
 	}
 }
 
