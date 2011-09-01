@@ -95,7 +95,6 @@ struct ssdcache_c {
 	unsigned long block_size;
 	unsigned long block_mask;
 	sector_t data_offset;
-	unsigned int assoc;
 	unsigned long nr_sio;
 	enum ssdcache_mode_t cache_mode;
 	enum ssdcache_strategy_t cache_strategy;
@@ -260,7 +259,7 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
 	if (!cmd)
 		return NULL;
 	cmd->index = hash_number;
-	cmd->num_cte = (1UL << sc->hash_shift) * sc->assoc;
+	cmd->num_cte = (1UL << sc->hash_shift) * DEFAULT_ASSOCIATIVITY;
 	spin_lock_init(&cmd->lock);
 	cmd->atime = jiffies;
 
@@ -1364,12 +1363,16 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	if (argc >= 4) {
-		if (sscanf(argv[3], "%u", &sc->assoc) != 1) {
-			ti->error = "dm-ssdcache: Invalid associativity";
-			sc->block_size = DEFAULT_BLOCKSIZE;
+		if (!strncmp(argv[3], "lru", 3)) {
+			sc->cache_strategy = CACHE_LRU;
+		} else if (!strncmp(argv[3], "lfu", 3)) {
+			sc->cache_strategy = CACHE_LFU;
+		} else {
+			ti->error = "dm-ssdcache: invalid strategy";
+			sc->cache_strategy = default_cache_strategy;
 		}
 	} else {
-		sc->assoc = DEFAULT_ASSOCIATIVITY;
+		sc->cache_strategy = default_cache_strategy;
 	}
 
 	if (argc >= 5) {
@@ -1385,8 +1388,6 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		sc->cache_mode = default_cache_mode;
 	}
 
-	sc->cache_strategy = default_cache_strategy;
-
 	sc->iocp = dm_io_client_create();
 	if (IS_ERR(sc->iocp)) {
 		r = PTR_ERR(sc->iocp);
@@ -1399,7 +1400,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	cdev_size = i_size_read(sc->cache_dev->bdev->bd_inode);
 	tdev_size = i_size_read(sc->target_dev->bdev->bd_inode);
 
-	num_cte = cdev_size / sc->block_size / sc->assoc;
+	num_cte = cdev_size / sc->block_size / DEFAULT_ASSOCIATIVITY;
 
 	/*
 	 * Hash bit calculation might return a lower number
@@ -1499,15 +1500,16 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
 			 "cache %lu/%lu/%lu/%lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
-			 (1UL << sc->hash_bits) * sc->assoc,
+			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->nr_sio, sc->cache_hits,
 			 sc->cache_bypassed, sc->cache_evictions);
 		break;
 
 	case STATUSTYPE_TABLE:
-		snprintf(result, maxlen, "%s %s %lu %u %s",
+		snprintf(result, maxlen, "%s %s %lu %s %s",
 			 sc->target_dev->name, sc->cache_dev->name,
-			 sc->block_size, sc->assoc,
+			 sc->block_size,
+			 sc->cache_strategy == CACHE_LRU ? "lru" : "lfu",
 			 sc->cache_mode == CACHE_IS_WRITETHROUGH ?
 			 "wt" : "wb" );
 		break;
