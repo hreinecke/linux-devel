@@ -53,8 +53,14 @@ enum ssdcache_strategy_t {
 	CACHE_LFU,
 };
 
+enum ssdcache_algorithm_t {
+	CACHE_ALG_HASH64,
+	CACHE_ALG_WRAP,
+};
+
 static enum ssdcache_mode_t default_cache_mode = CACHE_IS_WRITETHROUGH;
 static enum ssdcache_strategy_t default_cache_strategy = CACHE_LFU;
+static enum ssdcache_algorithm_t default_cache_algorithm = CACHE_ALG_WRAP;
 
 struct ssdcache_md;
 struct ssdcache_io;
@@ -1006,8 +1012,8 @@ static int do_io(struct ssdcache_io *sio)
 /*
  * Cache lookup and I/O handling
  */
-#if 0
-static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
+
+static unsigned long ssdcache_hash_64(struct ssdcache_c *sc, sector_t sector)
 {
 	unsigned long value, hash_number, offset, hash_mask, sector_shift;
 
@@ -1019,9 +1025,8 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 
 	return (hash_number << sc->hash_shift) | offset;
 }
-#endif
 
-static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
+static unsigned long ssdcache_hash_wrap(struct ssdcache_c *sc, sector_t sector)
 {
 	unsigned long sector_shift, value, hash_mask;
 
@@ -1030,6 +1035,14 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
 
 	return value & hash_mask;
+}
+
+static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
+{
+	if (default_cache_algorithm == CACHE_ALG_HASH64)
+		return ssdcache_hash_64(sc, sector);
+	else
+		return ssdcache_hash_wrap(sc, sector);
 }
 
 static int cte_match(struct ssdcache_c *sc,
