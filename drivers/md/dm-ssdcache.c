@@ -86,7 +86,6 @@ struct ssdcache_c {
 	enum ssdcache_mode_t cache_mode;
 	unsigned long cache_hits;
 	unsigned long cache_bypassed;
-	unsigned long cache_requeue;
 };
 
 struct ssdcache_io {
@@ -1476,11 +1475,12 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	rcu_read_unlock();
 	switch (type) {
 	case STATUSTYPE_INFO:
-		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu cache %lu/%lu/%lu/%lu",
+		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
+			 "cache %lu/%lu/%lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * sc->assoc,
 			 sc->nr_sio, sc->cache_hits,
-			 sc->cache_requeue, sc->cache_bypassed);
+			 sc->cache_bypassed);
 		break;
 
 	case STATUSTYPE_TABLE:
