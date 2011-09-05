@@ -531,7 +531,8 @@ static unsigned long sio_get_state(struct ssdcache_io *sio)
 
 	memset(&state, 0x11, sizeof(unsigned long));
 	rcu_read_lock();
-	if (sio && sio->cte_idx >= 0) {
+	BUG_ON(sio->cte_idx < 0);
+	if (sio) {
 		cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
 		if (cte)
 			state = cte->state;
@@ -592,7 +593,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 		newcte->atime = jiffies;
 		newcte->count++;
 	}
-	rcu_assign_pointer(sio->cmd->te[oldcte->index], newcte);
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
 	call_rcu(&oldcte->rcu, cte_reset);
 }
@@ -907,7 +908,7 @@ static void io_callback(unsigned long error, void *context)
 
 	if (error)
 		WPRINTK(sio, "finished with %lu", error);
-	BUG_ON(!sio->bio);
+
 	if (sio_is_state(sio, CTE_RESERVED)) {
 		requeue = finish_reserved(sio, error);
 	} else if (sio_is_state(sio, CTE_UPDATE)) {
@@ -941,10 +942,15 @@ static inline sector_t to_cache_sector(struct ssdcache_io *sio,
 
 	sector_offset = data_sector & sio->sc->block_mask;
 
+	BUG_ON(sio->cte_idx < 0);
 	cte_offset = to_sector(sio->cte_idx * sio->sc->block_size);
 	cmd_offset = to_sector(sio->cmd->hash * sio->cmd->num_cte * sio->sc->block_size);
 	cache_sector = sio->sc->data_offset + cmd_offset + cte_offset + sector_offset;
 
+	if (cache_sector > i_size_read(sio->sc->cache_dev->bdev->bd_inode)) {
+		WPRINTK(sio, "access beyond end of device");
+		BUG();
+	}
 	return cache_sector;
 }
 
@@ -1364,7 +1370,7 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
 		/* Direct and indirect write completed */
 		sio_set_state(sio, CTE_CLEAN);
-	} else if (!sio_is_state(sio, CTE_CLEAN) ||
+	} else if (!sio_is_state(sio, CTE_CLEAN) &&
 		   !sio_is_state(sio, CTE_INVALID)) {
 		WPRINTK(sio, "unhandled state %08lx",
 			sio_get_state(sio));
