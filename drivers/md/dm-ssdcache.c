@@ -251,7 +251,6 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
 					     unsigned long hash_number)
 {
 	struct ssdcache_md *cmd;
-	unsigned long flags;
 
 	cmd = cmd_lookup(sc, hash_number);
 	if (cmd)
@@ -270,14 +269,14 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
 		return NULL;
 	}
 
-	spin_lock_irqsave(&sc->cmd_lock, flags);
+	spin_lock(&sc->cmd_lock);
 	if (radix_tree_insert(&sc->md_tree, hash_number, cmd)) {
 		mempool_free(cmd, _cmd_pool);
 		cmd = radix_tree_lookup(&sc->md_tree, hash_number);
 		BUG_ON(!cmd);
 		BUG_ON(cmd->hash != hash_number);
 	}
-	spin_unlock_irqrestore(&sc->cmd_lock, flags);
+	spin_unlock(&sc->cmd_lock);
 
 	radix_tree_preload_end();
 	return cmd;
@@ -368,7 +367,6 @@ static void * cte_insert(struct ssdcache_c *sc, struct ssdcache_md *cmd,
 			 unsigned int index)
 {
 	struct ssdcache_te *newcte, *oldcte;
-	unsigned long flags;
 
 	rcu_read_lock();
 	newcte = rcu_dereference(cmd->te[index]);
@@ -380,11 +378,11 @@ static void * cte_insert(struct ssdcache_c *sc, struct ssdcache_md *cmd,
 	if (!newcte)
 		return NULL;
 
-	spin_lock_irqsave(&cmd->lock, flags);
+	spin_lock_irq(&cmd->lock);
 	oldcte = cmd->te[index];
 	cmd->atime = jiffies;
 	rcu_assign_pointer(cmd->te[index], newcte);
-	spin_unlock_irqrestore(&cmd->lock, flags);
+	spin_unlock_irq(&cmd->lock);
 	if (oldcte)
 		call_rcu(&oldcte->rcu, cte_reset);
 
@@ -560,7 +558,7 @@ static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 {
 	struct ssdcache_te *oldcte, *newcte = NULL;
-	unsigned long newstate, oldstate, tmpstate, flags;
+	unsigned long newstate, oldstate, tmpstate;
 
 	if (!sio || sio->cte_idx < 0)
 		return;
@@ -578,7 +576,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 		if (!newcte)
 			return;
 	}
-	spin_lock_irqsave(&sio->cmd->lock, flags);
+	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
 	if (newcte) {
 		if (!oldcte) {
@@ -594,7 +592,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 		newcte->count++;
 	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irqrestore(&sio->cmd->lock, flags);
+	spin_unlock_irq(&sio->cmd->lock);
 	if (oldcte)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
@@ -638,7 +636,7 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 {
 	struct ssdcache_te *oldcte, *newcte;
-	unsigned long oldstate, newstate, flags;
+	unsigned long oldstate, newstate;
 
 	BUG_ON(!sio->bio);
 	BUG_ON(sio->cte_idx < 0);
@@ -651,7 +649,7 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
 	newstate = sio_update_state(sio, oldstate, state);
 
-	spin_lock_irqsave(&sio->cmd->lock, flags);
+	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
 	BUG_ON(!oldcte);
 	*newcte = *oldcte;
@@ -660,7 +658,7 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	newcte->atime = jiffies;
 	newcte->count++;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irqrestore(&sio->cmd->lock, flags);
+	spin_unlock_irq(&sio->cmd->lock);
 	call_rcu(&oldcte->rcu, cte_reset);
 }
 
@@ -674,7 +672,6 @@ static void cte_restart_sequence(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *oldcte, *newcte;
 	sector_t sector;
-	unsigned long flags;
 
 	BUG_ON(!sio->bio);
 	BUG_ON(sio->cte_idx < 0);
@@ -693,14 +690,14 @@ static void cte_restart_sequence(struct ssdcache_io *sio)
 	if (!newcte)
 		return;
 
-	spin_lock_irqsave(&sio->cmd->lock, flags);
+	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
 	BUG_ON(!oldcte);
 	*newcte = *oldcte;
 	newcte->atime = jiffies;
 	newcte->count++;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irqrestore(&sio->cmd->lock, flags);
+	spin_unlock_irq(&sio->cmd->lock);
 	call_rcu(&oldcte->rcu, cte_reset);
 }
 
@@ -826,16 +823,15 @@ static void do_sio(struct work_struct *ignored)
 static struct bio * sio_fetch_writeback_bio(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *cte;
-	unsigned long flags;
 	struct bio *bio;
 
 	if (!sio || !sio->cmd || sio->cte_idx < 0)
 		return NULL;
 
-	spin_lock_irqsave(&sio->cmd->lock, flags);
+	spin_lock_irq(&sio->cmd->lock);
 	cte = sio->cmd->te[sio->cte_idx];
 	bio = bio_list_pop(&cte->writeback);
-	spin_unlock_irqrestore(&sio->cmd->lock, flags);
+	spin_unlock_irq(&sio->cmd->lock);
 
 	return bio;
 }
@@ -1490,7 +1486,7 @@ static void ssdcache_dtr(struct dm_target *ti)
 {
 	struct ssdcache_c *sc = (struct ssdcache_c *) ti->private;
 	struct ssdcache_te *cte;
-	unsigned long pos = 0, nr_cmds, flags;
+	unsigned long pos = 0, nr_cmds;
 	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
 	int i, j;
 
@@ -1501,18 +1497,18 @@ static void ssdcache_dtr(struct dm_target *ti)
 		for (i = 0; i < nr_cmds; i++) {
 			pos = cmds[i]->hash;
 			cmd = radix_tree_delete(&sc->md_tree, pos);
-			spin_lock_irqsave(&cmd->lock, flags);
+			spin_lock_irq(&cmd->lock);
 			for (j = 0; j < cmd->num_cte; j++) {
 				if (cmd->te[j]) {
 					cte = cmd->te[j];
 					rcu_assign_pointer(cmd->te[j], NULL);
-					spin_unlock_irqrestore(&cmd->lock, flags);
+					spin_unlock_irq(&cmd->lock);
 					synchronize_rcu();
 					mempool_free(cte, _cte_pool);
-					spin_lock_irqsave(&cmd->lock, flags);
+					spin_lock_irq(&cmd->lock);
 				}
 			}
-			spin_unlock_irqrestore(&cmd->lock, flags);
+			spin_unlock_irq(&cmd->lock);
 			mempool_free(cmd, _cmd_pool);
 		}
 		pos++;
