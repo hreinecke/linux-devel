@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-#define SSD_DEBUG
+// #define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -533,8 +533,8 @@ static unsigned long sio_get_state(struct ssdcache_io *sio)
 	rcu_read_lock();
 	if (sio && sio->cte_idx >= 0) {
 		cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
-		BUG_ON(!cte);
-		state = cte->state;
+		if (cte)
+			state = cte->state;
 	}
 	rcu_read_unlock();
 
@@ -1048,6 +1048,11 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 		return ssdcache_hash_wrap(sc, sector);
 }
 
+static unsigned long rotate(struct ssdcache_c *sc, unsigned long value)
+{
+	return (value << 2) | (value >> ((sc->hash_bits - sc->hash_shift) - 2));
+}
+
 static int cte_lookup(struct ssdcache_c *sc,
 		     struct ssdcache_md *cmd,
 		     struct bio *bio)
@@ -1080,14 +1085,14 @@ static int cte_match(struct ssdcache_c *sc,
 {
 	sector_t data_sector;
 	struct ssdcache_te *cte;
-	unsigned long cte_atime, clean_atime, oldest_atime, flags;
-	unsigned long cte_count, clean_count, oldest_count;
-	int invalid = -1, clean, oldest, i, busy = 0;
+	unsigned long cte_atime, oldest_atime, flags;
+	unsigned long cte_count, oldest_count;
+	int invalid = -1, oldest, i, busy = 0;
 
 	data_sector = cte_bio_align(sc, bio);
-	clean_atime = oldest_atime = jiffies;
-	clean_count = oldest_count = -1;
-	clean = oldest = -1;
+	oldest_atime = jiffies;
+	oldest_count = -1;
+	oldest = -1;
 
 	for (i = 0; i < cmd->num_cte; i++) {
 		cte = cmd->te[i];
@@ -1106,17 +1111,15 @@ static int cte_match(struct ssdcache_c *sc,
 			busy++;
 			continue;
 		}
-
+		/* Can only eject CLEAN entries */
+		if (!cte_is_state(sc, cte, bio, CTE_CLEAN))
+			continue;
 		if (sc->cache_strategy == CACHE_LRU) {
 			/* Select the oldest clean entry */
 			rcu_read_lock();
 			cte_atime = rcu_dereference(cte)->atime;
 			rcu_read_unlock();
-			if (cte_is_state(sc, cte, bio, CTE_CLEAN) &&
-			    time_before_eq(cte_atime, clean_atime)) {
-				clean_atime = cte_atime;
-				clean = i;
-			} else if (time_before_eq(cte_atime, oldest_atime)) {
+			if (time_before_eq(cte_atime, oldest_atime)) {
 				oldest_atime = cte_atime;
 				oldest = i;
 			}
@@ -1125,11 +1128,7 @@ static int cte_match(struct ssdcache_c *sc,
 			rcu_read_lock();
 			cte_count = rcu_dereference(cte)->count;
 			rcu_read_unlock();
-			if (cte_is_state(sc, cte, bio, CTE_CLEAN) &&
-			    cte_count <= clean_count) {
-				clean_count = cte_count;
-				clean = i;
-			} else if (cte_count <= oldest_count) {
+			if (cte_count <= oldest_count) {
 				oldest_count = cte_count;
 				oldest = i;
 			}
@@ -1139,10 +1138,10 @@ static int cte_match(struct ssdcache_c *sc,
 	if (invalid != -1)
 		return invalid;
 
-	if (clean != -1) {
+	if (oldest != -1) {
 #ifdef SSD_DEBUG
-		DPRINTK("%s (cte %lx:%x): drop clean cte", __FUNCTION__,
-			cmd->hash, clean);
+		DPRINTK("%s (cte %lx:%x): drop oldest cte", __FUNCTION__,
+			cmd->hash, oldest);
 
 		for (i = 0; i < cmd->num_cte; i++) {
 			sector_t cte_sector;
@@ -1164,20 +1163,6 @@ static int cte_match(struct ssdcache_c *sc,
 					__FUNCTION__, cmd->hash, i);
 			}
 		}
-#endif
-		spin_lock_irqsave(&cmd->lock, flags);
-		cte = cmd->te[clean];
-		rcu_assign_pointer(cmd->te[clean], NULL);
-		spin_unlock_irqrestore(&cmd->lock, flags);
-		call_rcu(&cte->rcu, cte_reset);
-		sc->cache_evictions++;
-		return clean;
-	}
-
-	if (oldest != -1) {
-#ifdef SSD_DEBUG
-		DPRINTK("%s (cte %lx:%x): drop oldest cte, %d/%d ctes busy",
-			__FUNCTION__, cmd->hash, oldest, busy, i);
 #endif
 		spin_lock_irqsave(&cmd->lock, flags);
 		cte = cmd->te[oldest];
@@ -1248,7 +1233,7 @@ retry:
 			assoc++;
 			DPRINTK("(cte %04lx:ff): retry with assoc %d",
 				sio->cmd->hash, assoc);
-			hash_number = rol16(hash_number, 2);
+			hash_number = rotate(sc, hash_number);
 			goto retry;
 		}
 		sio->cte_idx = cte_match(sc, sio->cmd, bio);
