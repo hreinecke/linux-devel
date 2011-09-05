@@ -98,6 +98,7 @@ struct ssdcache_c {
 	unsigned long nr_sio;
 	enum ssdcache_mode_t cache_mode;
 	enum ssdcache_strategy_t cache_strategy;
+	unsigned long cache_misses;
 	unsigned long cache_hits;
 	unsigned long cache_bypassed;
 	unsigned long cache_evictions;
@@ -1226,7 +1227,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 
 	if (cte_match_sector(sc, cte, bio)) {
 		/* Cache hit */
-		sc->cache_hits++;
 		WPRINTK(sio, "%s hit %llu state %08lx/%08lx",
 			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
@@ -1241,6 +1241,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			return DM_MAPIO_REMAPPED;
 		}
 		if (bio_data_dir(bio) == READ) {
+			sc->cache_hits++;
 			cte_restart_sequence(sio);
 			bio->bi_bdev = sc->cache_dev->bdev;
 			bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
@@ -1269,6 +1270,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		bio_get(bio);
 		map_context->ptr = sio;
 		if (bio_data_dir(bio) == READ) {
+			sc->cache_misses++;
 			cte_start_sequence(sio, CTE_PREFETCH);
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
@@ -1526,7 +1528,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			 "cache %lu/%lu/%lu/%lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
-			 sc->nr_sio, sc->cache_hits,
+			 sc->cache_misses, sc->cache_hits,
 			 sc->cache_bypassed, sc->cache_evictions);
 		break;
 
