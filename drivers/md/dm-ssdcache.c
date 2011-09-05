@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-// #define SSD_DEBUG
+#define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -580,7 +580,14 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
 	if (newcte) {
-		*newcte = *oldcte;
+		if (!oldcte) {
+			newcte->index = sio->cte_idx;
+			newcte->count = 0;
+			newcte->md = sio->cmd;
+			bio_list_init(&newcte->writeback);
+		} else
+			*newcte = *oldcte;
+
 		newcte->state = newstate;
 		newcte->atime = jiffies;
 		newcte->count++;
@@ -1357,7 +1364,8 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
 		/* Direct and indirect write completed */
 		sio_set_state(sio, CTE_CLEAN);
-	} else if (!sio_is_state(sio, CTE_CLEAN)) {
+	} else if (!sio_is_state(sio, CTE_CLEAN) ||
+		   !sio_is_state(sio, CTE_INVALID)) {
 		WPRINTK(sio, "unhandled state %08lx",
 			sio_get_state(sio));
 	}
