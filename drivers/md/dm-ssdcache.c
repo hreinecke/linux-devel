@@ -595,7 +595,8 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irqrestore(&sio->cmd->lock, flags);
-	call_rcu(&oldcte->rcu, cte_reset);
+	if (oldcte)
+		call_rcu(&oldcte->rcu, cte_reset);
 }
 
 static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
@@ -652,6 +653,7 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
+	BUG_ON(!oldcte);
 	*newcte = *oldcte;
 	newcte->sector = cte_bio_align(sio->sc, sio->bio);
 	newcte->state = newstate;
@@ -693,6 +695,7 @@ static void cte_restart_sequence(struct ssdcache_io *sio)
 
 	spin_lock_irqsave(&sio->cmd->lock, flags);
 	oldcte = sio->cmd->te[sio->cte_idx];
+	BUG_ON(!oldcte);
 	*newcte = *oldcte;
 	newcte->atime = jiffies;
 	newcte->count++;
@@ -1063,7 +1066,12 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 
 static unsigned long rotate(struct ssdcache_c *sc, unsigned long value)
 {
-	return (value << 2) | (value >> ((sc->hash_bits - sc->hash_shift) - 2));
+	unsigned long result, hash_mask;
+
+	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
+	result = (value << 2);
+	result |= (value >> ((sc->hash_bits - sc->hash_shift) - 2));
+	return result & hash_mask;
 }
 
 static int cte_lookup(struct ssdcache_c *sc,
@@ -1098,7 +1106,7 @@ static int cte_match(struct ssdcache_c *sc,
 {
 	sector_t data_sector;
 	struct ssdcache_te *cte;
-	unsigned long cte_atime, oldest_atime, flags;
+	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
 	int invalid = -1, oldest, i, busy = 0;
 
@@ -1156,32 +1164,7 @@ static int cte_match(struct ssdcache_c *sc,
 		DPRINTK("%s (cte %lx:%x): drop oldest cte", __FUNCTION__,
 			cmd->hash, oldest);
 
-		for (i = 0; i < cmd->num_cte; i++) {
-			sector_t cte_sector;
-			unsigned long cte_state;
-
-			cte = cmd->te[i];
-			if (cte) {
-				rcu_read_lock();
-				cte_count = rcu_dereference(cte)->count;
-				cte_sector = rcu_dereference(cte)->sector;
-				cte_state = rcu_dereference(cte)->state;
-				rcu_read_unlock();
-				DPRINTK("%s (cte %lx:%x): sector %lx "
-					"state %08lx count %ld",
-					__FUNCTION__, cmd->hash, i,
-					cte_sector, cte_state, cte_count);
-			} else {
-				DPRINTK("%s (cte %lx:%x): unassigned",
-					__FUNCTION__, cmd->hash, i);
-			}
-		}
 #endif
-		spin_lock_irqsave(&cmd->lock, flags);
-		cte = cmd->te[oldest];
-		rcu_assign_pointer(cmd->te[oldest], NULL);
-		spin_unlock_irqrestore(&cmd->lock, flags);
-		call_rcu(&cte->rcu, cte_reset);
 		sc->cache_evictions++;
 		return oldest;
 	}
@@ -1242,7 +1225,7 @@ retry:
 
 	sio->cte_idx = cte_lookup(sc, sio->cmd, bio);
 	if (sio->cte_idx < 0) {
-		if (assoc < DEFAULT_ASSOCIATIVITY) {
+		if (assoc < 2) {
 			assoc++;
 			DPRINTK("(cte %04lx:ff): retry with assoc %d",
 				sio->cmd->hash, assoc);
@@ -1268,7 +1251,7 @@ retry:
 	if (cte_match_sector(sc, cte, bio)) {
 		/* Cache hit */
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "%s hit %llu state %08lx/%08lx",
+		WPRINTK(sio, "%s hit %llx state %08lx/%08lx",
 			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
@@ -1307,7 +1290,7 @@ retry:
 		res = DM_MAPIO_REMAPPED;
 	} else {
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "%s: miss %llu state %08lx/%08lx",
+		WPRINTK(sio, "%s: miss %llx state %08lx/%08lx",
 			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
