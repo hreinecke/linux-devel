@@ -979,14 +979,6 @@ static int do_io(struct ssdcache_io *sio)
 		write_to_cache(sio);
 		return 0;
 	}
-	if (sio_is_state(sio, CTE_UPDATE)) {
-		write_to_cache(sio);
-		return 0;
-	}
-	if (sio_is_state(sio, CTE_WRITEBACK)) {
-		write_to_target(sio);
-		return 0;
-	}
 	WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
 	return EINVAL;
 }
