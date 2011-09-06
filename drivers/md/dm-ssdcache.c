@@ -608,20 +608,13 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 	oldstate = rcu_dereference(cte)->state;
 	rcu_read_unlock();
 
-	if (bio) {
-		num_sectors = to_sector(bio->bi_size);
-		offset= cte_bio_offset(sc, bio);
-	} else {
-		num_sectors = to_sector(sc->block_size);
-		offset = 0;
-	}
+	num_sectors = to_sector(bio->bi_size);
+	offset= cte_bio_offset(sc, bio);
+
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
-		match += ((tmpstate == CTE_UPDATE) ||
-			  (tmpstate == CTE_PREFETCH) ||
+		match += ((tmpstate == CTE_PREFETCH) ||
 			  (tmpstate == CTE_RESERVED));
-		if (!bio || bio_data_dir(bio) == WRITE)
-			match += (tmpstate == CTE_WRITEBACK);
 	}
 	return (match > 0);
 }
@@ -1006,7 +999,10 @@ static int do_io(struct ssdcache_io *sio)
 		}
 	}
 	BUG_ON(bio_data_dir(sio->bio) == READ);
-	if (sio_is_state(sio, CTE_RESERVED)) {
+	if (sio_is_state(sio, CTE_PREFETCH)) {
+		/* Move to RESERVED */
+		sio_set_state(sio, CTE_RESERVED);
+		/* And start writing to cache device */
 		write_to_cache(sio);
 		return 0;
 	}
@@ -1330,8 +1326,6 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	}
 
 	if (sio_is_state(sio, CTE_PREFETCH)) {
-		/* Move to RESERVED */
-		sio_set_state(sio, CTE_RESERVED);
 		/* Setup clone for writing to cache device */
 		clone = bio_clone(sio->bio, GFP_NOWAIT);
 		clone->bi_rw |= WRITE;
