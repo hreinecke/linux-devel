@@ -626,8 +626,6 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 	return (match > 0);
 }
 
-#define sio_cte_is_busy(s) cte_is_busy((s)->sc,(s)->cmd->te[(s)->cte_idx],(s)->bio)
-
 /*
  * cte_start_sequence
  *
