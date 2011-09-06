@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-#define SSD_DEBUG
+// #define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -40,7 +40,7 @@
 #define DEFAULT_CTE_NUM 4096
 
 #define DEFAULT_BLOCKSIZE	4096
-#define DEFAULT_ASSOCIATIVITY	8
+#define DEFAULT_ASSOCIATIVITY	32
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -459,6 +459,7 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 	case CTE_PREFETCH:
 		switch (oldstate) {
 		case CTE_INVALID:
+		case CTE_CLEAN:
 			break;
 		default:
 			illegal_transition++;
@@ -613,8 +614,11 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
-		match += ((tmpstate == CTE_PREFETCH) ||
-			  (tmpstate == CTE_RESERVED));
+		match += (tmpstate == CTE_PREFETCH);
+		if (bio_data_dir(bio) == READ)
+			match += (tmpstate == CTE_RESERVED);
+		else
+			match += (tmpstate == CTE_WRITEBACK);
 	}
 	return (match > 0);
 }
@@ -972,10 +976,8 @@ static int do_io(struct ssdcache_io *sio)
 	BUG_ON(sio->cte_idx < 0);
 	BUG_ON(!sio->bio);
 	BUG_ON(bio_data_dir(sio->bio) == READ);
-	if (sio_is_state(sio, CTE_PREFETCH)) {
-		/* Move to RESERVED */
-		sio_set_state(sio, CTE_RESERVED);
-		/* And start writing to cache device */
+	if (sio_is_state(sio, CTE_RESERVED)) {
+		/* Start writing to cache device */
 		write_to_cache(sio);
 		return 0;
 	}
@@ -1029,32 +1031,6 @@ static unsigned long rotate(struct ssdcache_c *sc, unsigned long value)
 	return result & hash_mask;
 }
 
-static int cte_lookup(struct ssdcache_c *sc,
-		     struct ssdcache_md *cmd,
-		     struct bio *bio)
-{
-	sector_t data_sector;
-	struct ssdcache_te *cte;
-	int i, invalid = -1;
-
-	data_sector = cte_bio_align(sc, bio);
-	for (i = 0; i < cmd->num_cte; i++) {
-		cte = cmd->te[i];
-		if (!cte || cte_is_state(sc, cte, bio, CTE_INVALID)) {
-			if (invalid < 0)
-				invalid = i;
-			continue;
-		} else if (cte_match_sector(sc, cte, bio)) {
-			return i;
-		}
-		/* Break out if we have found an invalid entry */
-		if (invalid != -1)
-			break;
-	}
-
-	return invalid;
-}
-
 static int cte_match(struct ssdcache_c *sc,
 		     struct ssdcache_md *cmd,
 		     struct bio *bio)
@@ -1084,12 +1060,22 @@ static int cte_match(struct ssdcache_c *sc,
 			break;
 		/* Ignore transient states */
 		if (cte_is_busy(sc, cte, bio)) {
+#ifdef SSD_DEBUG
+			DPRINTK("%s: (cte %lx:%x): ignore busy cte",
+				__FUNCTION__, cmd->hash, i);
+#endif
 			busy++;
 			continue;
 		}
 		/* Can only eject CLEAN entries */
-		if (!cte_is_state(sc, cte, bio, CTE_CLEAN))
+		if (!cte_is_state(sc, cte, bio, CTE_CLEAN)) {
+#ifdef SSD_DEBUG
+			DPRINTK("%s: (cte %lx:%x): skip not-clean cte",
+				__FUNCTION__, cmd->hash, i);
+#endif
+			busy++;
 			continue;
+		}
 		if (sc->cache_strategy == CACHE_LRU) {
 			/* Select the oldest clean entry */
 			rcu_read_lock();
@@ -1124,8 +1110,8 @@ static int cte_match(struct ssdcache_c *sc,
 		return oldest;
 	}
 
-	DPRINTK("%s (cte %lx:%x): %d ctes busy", __FUNCTION__,
-		cmd->hash, -1, busy);
+	DPRINTK("%s (cte %lx:ff): %d ctes busy", __FUNCTION__,
+		cmd->hash, busy);
 	return -1;
 }
 
@@ -1137,7 +1123,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	unsigned long hash_number, state = 0;
 	struct ssdcache_te *cte;
 	struct ssdcache_io *sio;
-	int res = DM_MAPIO_SUBMITTED, assoc = 0;
 
 	if (bio->bi_rw & REQ_FLUSH) {
 		bio->bi_bdev = sc->target_dev->bdev;
@@ -1167,7 +1152,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	}
 
 	/* Lookup cmd */
-retry:
 	sio->cmd = cmd_insert(sc, hash_number);
 	if (!sio->cmd) {
 		DPRINTK("cache insertion failure");
@@ -1178,24 +1162,13 @@ retry:
 		return DM_MAPIO_REMAPPED;
 	}
 
-	sio->cte_idx = cte_lookup(sc, sio->cmd, bio);
+	sio->cte_idx = cte_match(sc, sio->cmd, bio);
 	if (sio->cte_idx < 0) {
-		if (assoc < 2) {
-			assoc++;
-			DPRINTK("(cte %04lx:ff): retry with assoc %d",
-				sio->cmd->hash, assoc);
-			hash_number = rotate(sc, hash_number);
-			goto retry;
-		}
-		sio->cte_idx = cte_match(sc, sio->cmd, bio);
-		if (sio->cte_idx < 0) {
-			DPRINTK("bypass cte sio");
-			sc->cache_bypassed++;
-			bio->bi_bdev = sc->target_dev->bdev;
-			map_context->ptr = NULL;
-			ssdcache_put_sio(sio);
-			return DM_MAPIO_REMAPPED;
-		}
+		sc->cache_bypassed++;
+		bio->bi_bdev = sc->target_dev->bdev;
+		map_context->ptr = NULL;
+		ssdcache_put_sio(sio);
+		return DM_MAPIO_REMAPPED;
 	}
 
 	cte = cte_insert(sc, sio->cmd, sio->cte_idx);
@@ -1214,7 +1187,7 @@ retry:
 
 		if (cte_is_busy(sc, cte, bio)) {
 			/* Bypass cache */
-			WPRINTK(sio, "bypass busy cte");
+			WPRINTK(sio, "bypass busy cte in state %08lx", state);
 			sc->cache_bypassed++;
 			bio->bi_bdev = sc->target_dev->bdev;
 			ssdcache_put_sio(sio);
@@ -1230,19 +1203,8 @@ retry:
 			map_context->ptr = NULL;
 			return DM_MAPIO_REMAPPED;
 		}
-		cte_start_sequence(sio, CTE_UPDATE);
 		map_context->ptr = sio;
-		ssdcache_get_sio(sio);
 		bio_get(bio);
-		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
-			bio->bi_bdev = sc->target_dev->bdev;
-			write_to_cache(sio);
-		} else {
-			bio->bi_bdev = sc->cache_dev->bdev;
-			bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-			write_to_target(sio);
-		}
-		res = DM_MAPIO_REMAPPED;
 	} else {
 #ifdef SSD_DEBUG
 		WPRINTK(sio, "%s: miss %llx state %08lx/%08lx",
@@ -1258,19 +1220,18 @@ retry:
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
-		ssdcache_get_sio(sio);
-		cte_start_sequence(sio, CTE_UPDATE);
-		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
-			bio->bi_bdev = sc->target_dev->bdev;
-			write_to_cache(sio);
-		} else {
-			bio->bi_bdev = sc->cache_dev->bdev;
-			bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-			write_to_target(sio);
-		}
-		res = DM_MAPIO_REMAPPED;
 	}
-	return res;
+	ssdcache_get_sio(sio);
+	cte_start_sequence(sio, CTE_UPDATE);
+	if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+		bio->bi_bdev = sc->target_dev->bdev;
+		write_to_cache(sio);
+	} else {
+		bio->bi_bdev = sc->cache_dev->bdev;
+		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+		write_to_target(sio);
+	}
+	return DM_MAPIO_REMAPPED;
 }
 
 static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
@@ -1291,6 +1252,8 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	}
 
 	if (sio_is_state(sio, CTE_PREFETCH)) {
+		/* Move to RESERVED */
+		sio_set_state(sio, CTE_RESERVED);
 		/* Setup clone for writing to cache device */
 		clone = bio_clone(sio->bio, GFP_NOWAIT);
 		clone->bi_rw |= WRITE;
