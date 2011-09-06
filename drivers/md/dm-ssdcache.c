@@ -811,22 +811,6 @@ static void do_sio(struct work_struct *ignored)
 	}
 }
 
-static struct bio * sio_fetch_writeback_bio(struct ssdcache_io *sio)
-{
-	struct ssdcache_te *cte;
-	struct bio *bio;
-
-	if (!sio || !sio->cmd || sio->cte_idx < 0)
-		return NULL;
-
-	spin_lock_irq(&sio->cmd->lock);
-	cte = sio->cmd->te[sio->cte_idx];
-	bio = bio_list_pop(&cte->writeback);
-	spin_unlock_irq(&sio->cmd->lock);
-
-	return bio;
-}
-
 /*
  * finish_reserved
  *
@@ -986,18 +970,7 @@ static void write_to_target(struct ssdcache_io *sio)
 static int do_io(struct ssdcache_io *sio)
 {
 	BUG_ON(sio->cte_idx < 0);
-	if (!sio->bio) {
-		/* Fetch first writeback bio */
-		sio->bio = sio_fetch_writeback_bio(sio);
-		if (!sio->bio) {
-			WPRINTK(sio, "no bio");
-			ssdcache_put_sio(sio);
-			return 0;
-		} else {
-			WPRINTK(sio, "fetch writeback bio");
-			cte_start_sequence(sio, CTE_WRITEBACK);
-		}
-	}
+	BUG_ON(!sio->bio);
 	BUG_ON(bio_data_dir(sio->bio) == READ);
 	if (sio_is_state(sio, CTE_PREFETCH)) {
 		/* Move to RESERVED */
