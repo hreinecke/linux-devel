@@ -506,7 +506,7 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 				      enum cte_state state)
 {
 	unsigned long newstate = 0, state_shift, tmpmask;
-	int i;
+	int i, illegal = 0;
 	enum cte_state tmpstate;
 
 	for (i = 0; i < to_sector(sio->sc->block_size); i++) {
@@ -515,13 +515,14 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 		if (tmpmask == 0xF) {
 			tmpstate = (oldstate >> state_shift) & 0xF;
 			if (cte_check_state_transition(tmpstate, state)) {
-				DPRINTK("Illegal state transition %s -> %s",
-					cte_state_name(tmpstate),
-					cte_state_name(state));
+				illegal++;
 			}
 		}
 		newstate |= (unsigned long)state << state_shift;
 	}
+	if (illegal)
+		WPRINTK(sio, "illegal state transition %08lx:%08lx",
+			oldstate, newstate & sio->bio_mask);
 
 	return (oldstate & ~(sio->bio_mask)) | (newstate & sio->bio_mask);
 }
@@ -584,6 +585,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 
 		newcte->state = newstate;
 		newcte->atime = jiffies;
+		newcte->sector = oldcte->sector;
 	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
@@ -608,9 +610,7 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
 		match += (tmpstate == CTE_PREFETCH);
-		if (bio_data_dir(bio) == READ)
-			match += (tmpstate == CTE_RESERVED);
-		else
+		if (bio_data_dir(bio) == WRITE)
 			match += ((tmpstate == CTE_UPDATE) ||
 				  (tmpstate == CTE_WRITEBACK));
 	}
@@ -632,6 +632,25 @@ static bool cte_is_error(struct ssdcache_c *sc, struct ssdcache_te * cte)
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> (i * 4)) & 0xF;
 		match += (tmpstate == CTE_ERROR);
+	}
+	return (match > 0);
+}
+
+static bool cte_is_invalid(struct ssdcache_c *sc, struct ssdcache_te * cte)
+{
+	unsigned long oldstate, num_sectors;
+	enum cte_state tmpstate;
+	int match = 0, i;
+
+	rcu_read_lock();
+	oldstate = rcu_dereference(cte)->state;
+	rcu_read_unlock();
+
+	num_sectors = to_sector(sc->block_size);
+
+	for (i = 0; i < num_sectors; i++) {
+		tmpstate = (oldstate >> (i * 4)) & 0xF;
+		match += (tmpstate == CTE_INVALID);
 	}
 	return (match > 0);
 }
@@ -702,6 +721,7 @@ static void cte_restart_sequence(struct ssdcache_io *sio)
 	newcte->atime = jiffies;
 	newcte->count = oldcte->count + 1;
 	newcte->state = oldcte->state;
+	newcte->sector = sector;
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
 	call_rcu(&oldcte->rcu, cte_reset);
@@ -990,6 +1010,8 @@ static int do_io(struct ssdcache_io *sio)
 		/* Start writing to cache device */
 		write_to_cache(sio);
 		return 0;
+	} else if (sio_is_state(sio, CTE_CLEAN)) {
+		return 0;
 	}
 	WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
 	return EINVAL;
@@ -1048,7 +1070,7 @@ static int cte_match(struct ssdcache_c *sc,
 
 	for (i = 0; i < cmd->num_cte; i++) {
 		cte = cmd->te[i];
-		if (!cte || cte_is_state(sc, cte, bio, CTE_INVALID)) {
+		if (!cte || cte_is_invalid(sc, cte)) {
 			if (invalid < 0)
 				invalid = i;
 			continue;
@@ -1188,6 +1210,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		    cte_is_error(sc, cte)) {
 			sc->cache_bypassed++;
 			cte_start_sequence(sio, CTE_ERROR);
+			WPRINTK(sio, "error sequence state %08lx/%08lx",
+				state, cte_bio_mask(sc, bio));
 			bio->bi_bdev = sc->target_dev->bdev;
 			map_context->ptr = sio;
 			return DM_MAPIO_REMAPPED;
