@@ -101,6 +101,7 @@ struct ssdcache_c {
 	enum ssdcache_strategy_t cache_strategy;
 	unsigned long cache_misses;
 	unsigned long cache_hits;
+	unsigned long cache_busy;
 	unsigned long cache_bypassed;
 	unsigned long cache_evictions;
 };
@@ -1208,7 +1209,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		if (cte_is_busy(sc, cte, bio) ||
 		    cte_is_error(sc, cte)) {
-			sc->cache_bypassed++;
+			sc->cache_busy++;
 			cte_start_sequence(sio, CTE_ERROR);
 			WPRINTK(sio, "error sequence state %08lx/%08lx",
 				state, cte_bio_mask(sc, bio));
@@ -1492,10 +1493,11 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	switch (type) {
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
-			 "cache %lu/%lu/%lu/%lu",
+			 "cache misses %lu hits %lu busy %lu "
+			 "bypassed %lu evicts %lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
-			 sc->cache_misses, sc->cache_hits,
+			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_bypassed, sc->cache_evictions);
 		break;
 
