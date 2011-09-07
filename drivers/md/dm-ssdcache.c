@@ -140,7 +140,6 @@ enum cmd_state {
 
 /* Cache table entry states */
 enum cte_state {
-	CTE_SETUP,
 	/* Permanent states */
 	CTE_INVALID,	/* Sector not valid */
 	CTE_CLEAN,	/* Sector valid, Cache and target date identical */
@@ -292,7 +291,6 @@ static const struct {
 	enum cte_state value;
 	char *name;
 } cte_state_string[] = {
-	{ CTE_SETUP, "CTE_SETUP" },
 	{ CTE_INVALID, "CTE_INVALID"},
 	{ CTE_CLEAN, "CTE_CLEAN" },
 	{ CTE_DIRTY, "CTE_DIRTY" },
@@ -350,9 +348,6 @@ struct ssdcache_te * cte_new(struct ssdcache_c *sc, struct ssdcache_md *cmd,
 	newcte->index = index;
 	newcte->atime = jiffies;
 	newcte->count = 1;
-	for (i = 0; i < to_sector(sc->block_size); i++)
-		newstate |= (unsigned long)CTE_INVALID << (i * 4);
-	newcte->state = newstate;
 	newcte->md = cmd;
 	bio_list_init(&newcte->writeback);
 
@@ -423,12 +418,8 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		return 0;
 	/* Check state machine transitions */
 	switch (newstate) {
-	case CTE_SETUP:
-		illegal_transition++;
-		break;
 	case CTE_INVALID:
 		switch (oldstate) {
-		case CTE_SETUP:
 		case CTE_CLEAN:
 		case CTE_PREFETCH:
 		case CTE_RESERVED:
@@ -528,10 +519,9 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 
 static unsigned long sio_get_state(struct ssdcache_io *sio)
 {
-	unsigned long state;
+	unsigned long state = 0;
 	struct ssdcache_te *cte;
 
-	memset(&state, 0x11, sizeof(unsigned long));
 	rcu_read_lock();
 	BUG_ON(sio->cte_idx < 0);
 	if (sio) {
@@ -562,7 +552,7 @@ static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 {
 	struct ssdcache_te *oldcte, *newcte = NULL;
-	unsigned long newstate, oldstate, tmpstate;
+	unsigned long newstate, oldstate;
 
 	if (!sio || sio->cte_idx < 0)
 		return;
@@ -571,10 +561,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	newstate = sio_update_state(sio, oldstate, state);
 
 	/* Check if we should drop the old cte */
-	memset(&tmpstate, 0x11, sizeof(unsigned long));
-	tmpstate &= sio->sc->block_mask;
-
-	if ((newstate & sio->sc->block_mask) != tmpstate ) {
+	if ((newstate & sio->sc->block_mask) != 0 ) {
 		/* cte still valid */
 		newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
 		if (!newcte)
@@ -697,19 +684,17 @@ static inline bool cte_match_sector(struct ssdcache_c *sc,
 				    struct bio *bio)
 {
 	bool match = false;
-	unsigned long oldstate, tmpstate, bio_mask;
+	unsigned long oldstate, bio_mask;
 	sector_t sector;
 
 	if (!cte)
 		return match;
 
-	memset(&tmpstate, 0x11, sizeof(unsigned long));
-	bio_mask = cte_bio_mask(sc, bio);
 	rcu_read_lock();
 	sector = rcu_dereference(cte)->sector;
 	oldstate = rcu_dereference(cte)->state;
 	rcu_read_unlock();
-	if ((oldstate & bio_mask) != (tmpstate & bio_mask))
+	if ((oldstate & bio_mask) != 0)
 		match = (cte_bio_align(sc, bio) == sector);
 
 	return match;
