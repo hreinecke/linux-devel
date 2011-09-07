@@ -1081,15 +1081,6 @@ static int cte_match(struct ssdcache_c *sc,
 		/* Break out if we have found an invalid entry */
 		if (invalid != -1)
 			break;
-		/* Ignore transient states */
-		if (cte_is_busy(sc, cte, bio)) {
-#ifdef SSD_DEBUG
-			DPRINTK("%s: (cte %lx:%x): ignore busy cte",
-				__FUNCTION__, cmd->hash, i);
-#endif
-			busy++;
-			continue;
-		}
 		/* Can only eject CLEAN entries */
 		if (!cte_is_state(sc, cte, bio, CTE_CLEAN)) {
 #ifdef SSD_DEBUG
