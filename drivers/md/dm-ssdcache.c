@@ -385,15 +385,18 @@ static void * cte_insert(struct ssdcache_c *sc, struct ssdcache_md *cmd,
 	return newcte;
 }
 
-static inline int cte_is_state(struct ssdcache_c *sc, struct ssdcache_te *cte,
-			       struct bio *bio, enum cte_state state)
+static inline bool cte_is_state(struct ssdcache_c *sc, struct ssdcache_te *cte,
+				struct bio *bio, enum cte_state state)
 {
 	unsigned long oldstate;
 	enum cte_state tmpstate;
 	int i, offset, match = 0;
 
-	if (!cte)
-		return 0;
+	if (!cte) {
+		if (state == CTE_INVALID)
+			return true;
+		return false;
+	}
 
 	rcu_read_lock();
 	oldstate = rcu_dereference(cte)->state;
