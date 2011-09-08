@@ -553,8 +553,7 @@ static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 	unsigned long oldstate, newstate;
 	unsigned char tmpstate;
 
-	if (!sio)
-		return false;
+	BUG_ON(!sio);
 
 	oldstate = sio_get_state(sio);
 	tmpstate = state | (state << 4);
@@ -568,8 +567,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	struct ssdcache_te *oldcte, *newcte = NULL;
 	unsigned long newstate, oldstate;
 
-	if (!sio || sio->cte_idx < 0)
-		return;
+	BUG_ON(!sio || sio->cte_idx < 0);
 
 	oldstate = sio_get_state(sio);
 	newstate = sio_update_state(sio, oldstate, state);
@@ -617,6 +615,8 @@ static bool cte_is_busy(struct ssdcache_c *sc, struct ssdcache_te * cte,
 		if (bio_data_dir(bio) == WRITE)
 			match += ((tmpstate == CTE_UPDATE) ||
 				  (tmpstate == CTE_WRITEBACK));
+		else
+			match += (tmpstate == CTE_RESERVED);
 	}
 	return (match > 0);
 }
@@ -932,8 +932,8 @@ static void io_callback(unsigned long error, void *context)
 			bio_put(sio->bio);
 		ssdcache_put_sio(sio);
 	} else {
-		WPRINTK(sio, "unhandled state %08lx",
-			sio_get_state(sio));
+		WPRINTK(sio, "unhandled state %08lx:%08lx",
+			sio_get_state(sio), sio->bio_mask);
 		if (sio->bio) {
 			bio_put(sio->bio);
 			sio->bio = NULL;
