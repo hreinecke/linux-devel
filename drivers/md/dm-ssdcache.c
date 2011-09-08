@@ -549,12 +549,12 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
 	if (newcte) {
-		if (oldcte)
+		if (oldcte) {
 			newcte->count = oldcte->count + 1;
-
+			newcte->sector = oldcte->sector;
+		}
 		newcte->state = newstate;
 		newcte->atime = jiffies;
-		newcte->sector = oldcte->sector;
 	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
@@ -965,7 +965,7 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
-	int invalid, oldest, i, index = 0, busy = 0, assoc = 0;
+	int invalid, oldest, i, index, busy = 0, assoc = 0;
 
 	hash_number = hash_block(sio->sc, data_sector);
 
@@ -974,6 +974,7 @@ retry:
 	oldest_count = -1;
 	oldest = -1;
 	invalid = -1;
+	index = -1;
 
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
@@ -995,7 +996,7 @@ retry:
 		}
 	}
 
-	for (i = index; i < sio->cmd->num_cte; i++) {
+	for (i = 0; i < sio->cmd->num_cte; i++) {
 		struct ssdcache_te *cte;
 		unsigned long cte_state = 0;
 
