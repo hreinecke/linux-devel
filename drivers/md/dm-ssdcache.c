@@ -789,7 +789,7 @@ static void io_callback(unsigned long error, void *context)
 		sio_set_state(sio, CTE_CLEAN);
 	} else if (sio_is_state(sio, CTE_ERROR)) {
 		sio_set_state(sio, CTE_INVALID);
-	} else  {
+	} else if (!sio_is_state(sio, CTE_INVALID)) {
 		WPRINTK(sio, "unhandled state %08lx:%08lx",
 			sio_get_state(sio), sio->bio_mask);
 	}
@@ -1198,6 +1198,8 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 
 	if (error) {
 		WPRINTK(sio, "finished with %u", error);
+		if (sio_is_state(sio, CTE_PREFETCH))
+			bio_put(sio->bio);
 		sio_set_state(sio, CTE_INVALID);
 		goto finish;
 	}
