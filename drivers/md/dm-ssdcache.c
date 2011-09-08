@@ -763,13 +763,6 @@ static void finish_reserved(struct ssdcache_io *sio, unsigned long error)
 	int i;
 	struct bio_vec *bvec;
 
-	if (error) {
-		WPRINTK(sio, "error, mark cte invalid");
-		sio_set_state(sio, CTE_INVALID);
-	} else {
-		sio_set_state(sio, CTE_CLEAN);
-	}
-
 	if (sio->bio) {
 		/* Release bio */
 		bio_for_each_segment(bvec, sio->bio, i)
@@ -781,32 +774,26 @@ static void io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	if (error)
+	if (error) {
 		WPRINTK(sio, "finished with %lu", error);
+		sio_set_state(sio, CTE_INVALID);
+		goto out;
+	}
 
 	if (sio_is_state(sio, CTE_RESERVED)) {
+		sio_set_state(sio, CTE_CLEAN);
 		finish_reserved(sio, error);
 	} else if (sio_is_state(sio, CTE_UPDATE)) {
-		if (error) {
-			/* Move back to INVALID */
-			WPRINTK(sio, "error, mark cte invalid");
-			sio_set_state(sio, CTE_INVALID);
-		} else {
-			sio_set_state(sio, CTE_WRITEBACK);
-		}
+		sio_set_state(sio, CTE_WRITEBACK);
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
-		if (error) {
-			WPRINTK(sio, "error, mark cte invalid");
-			sio_set_state(sio, CTE_INVALID);
-		} else {
-			sio_set_state(sio, CTE_CLEAN);
-		}
+		sio_set_state(sio, CTE_CLEAN);
 	} else if (sio_is_state(sio, CTE_ERROR)) {
 		sio_set_state(sio, CTE_INVALID);
 	} else  {
 		WPRINTK(sio, "unhandled state %08lx:%08lx",
 			sio_get_state(sio), sio->bio_mask);
 	}
+out:
 	if (sio->bio) {
 		bio_put(sio->bio);
 		sio->bio = NULL;
