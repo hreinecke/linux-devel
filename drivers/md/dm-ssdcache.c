@@ -404,6 +404,7 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		break;
 	case CTE_CLEAN:
 		switch (oldstate) {
+		case CTE_DIRTY:
 		case CTE_WRITEBACK:
 		case CTE_RESERVED:
 			break;
@@ -599,96 +600,24 @@ static bool state_is_error(struct ssdcache_c *sc, unsigned long oldstate)
 	return (match > 0);
 }
 
-/*
- * cte_start_sequence
- *
- * Setup sio to start a new sequence starting with @state.
- */
-static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
-{
-	struct ssdcache_te *oldcte, *newcte;
-	unsigned long oldstate, newstate;
-
-	BUG_ON(!sio->bio);
-	BUG_ON(sio->cte_idx < 0);
-	oldstate = sio_get_state(sio);
-
-	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
-	if (!newcte)
-		return;
-
-	newstate = sio_update_state(sio, oldstate, state);
-
-	spin_lock_irq(&sio->cmd->lock);
-	oldcte = sio->cmd->te[sio->cte_idx];
-	BUG_ON(!oldcte);
-	newcte->sector = cte_bio_align(sio->sc, sio->bio);
-	newcte->state = newstate;
-	newcte->count = oldcte->count + 1;
-	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irq(&sio->cmd->lock);
-	call_rcu(&oldcte->rcu, cte_reset);
-}
-
-/*
- * cte_restart_sequence
- *
- * Setup a sio to start a sequence with no state change.
- * Only valid for read requests in CTE_DIRTY or CTE_CLEAN.
- */
-static void cte_restart_sequence(struct ssdcache_io *sio)
-{
-	struct ssdcache_te *oldcte, *newcte;
-	sector_t sector;
-
-	BUG_ON(!sio->bio);
-	BUG_ON(sio->cte_idx < 0);
-
-	rcu_read_lock();
-	sector = rcu_dereference(sio->cmd->te[sio->cte_idx])->sector;
-	rcu_read_unlock();
-
-	if (sector != cte_bio_align(sio->sc, sio->bio)) {
-		WPRINTK(sio, "access to non sector %llx/%llx",
-			(unsigned long long)cte_bio_align(sio->sc, sio->bio),
-			(unsigned long long)sector);
-	}
-
-	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
-	if (!newcte)
-		return;
-
-	spin_lock_irq(&sio->cmd->lock);
-	oldcte = sio->cmd->te[sio->cte_idx];
-	BUG_ON(!oldcte);
-	newcte->atime = jiffies;
-	newcte->count = oldcte->count + 1;
-	newcte->state = oldcte->state;
-	newcte->sector = sector;
-	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
-	spin_unlock_irq(&sio->cmd->lock);
-	call_rcu(&oldcte->rcu, cte_reset);
-}
-
 static bool match_sector(struct ssdcache_c *sc,
 			 struct ssdcache_md *cmd,
 			 unsigned long index,
 			 struct bio *bio)
 {
 	bool match = false;
-	unsigned long oldstate, bio_mask;
+	unsigned long oldstate;
 	sector_t sector;
 
 	BUG_ON(!cmd);
 	BUG_ON(index == (unsigned long)-1);
 
-	bio_mask = cte_bio_mask(sc, bio);
 	rcu_read_lock();
 	BUG_ON(!cmd->te[index]);
 	sector = rcu_dereference(cmd->te[index])->sector;
 	oldstate = rcu_dereference(cmd->te[index])->state;
 	rcu_read_unlock();
-	if ((oldstate & bio_mask) != 0)
+	if (oldstate != 0)
 		match = (cte_bio_align(sc, bio) == sector);
 
 	return match;
@@ -1055,6 +984,7 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 			DPRINTK("%lu: %s (cte %lx:%x): matching cte", sio->nr,
 				__FUNCTION__, sio->cmd->hash, i);
 			sio->cte_idx = i;
+			sio_set_state(sio, CTE_DIRTY);
 			return true;
 		}
 		/* Break out if we have found an invalid entry */
@@ -1173,7 +1103,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		if (state_is_busy(sc, bio, state) ||
 		    state_is_error(sc, state)) {
 			sc->cache_busy++;
-			cte_start_sequence(sio, CTE_ERROR);
+			sio_set_state(sio, CTE_ERROR);
 			WPRINTK(sio, "error sequence state %08lx/%08lx",
 				state, cte_bio_mask(sc, bio));
 			bio->bi_bdev = sc->target_dev->bdev;
@@ -1182,9 +1112,9 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		}
 		if (bio_data_dir(bio) == READ) {
 			sc->cache_hits++;
-			cte_restart_sequence(sio);
 			bio->bi_bdev = sc->cache_dev->bdev;
 			bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+			sio_set_state(sio, CTE_CLEAN);
 			ssdcache_put_sio(sio);
 			map_context->ptr = NULL;
 			return DM_MAPIO_REMAPPED;
