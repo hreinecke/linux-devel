@@ -815,6 +815,13 @@ static void io_callback(unsigned long error, void *context)
 		if (sio->bio)
 			bio_put(sio->bio);
 		ssdcache_put_sio(sio);
+	} else if (sio_is_state(sio, CTE_ERROR)) {
+		sio_set_state(sio, CTE_INVALID);
+		if (sio->bio) {
+			bio_put(sio->bio);
+			sio->bio = NULL;
+		}
+		ssdcache_put_sio(sio);
 	} else {
 		WPRINTK(sio, "unhandled state %08lx:%08lx",
 			sio_get_state(sio), sio->bio_mask);
@@ -1159,9 +1166,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			sc->cache_hits++;
 			bio->bi_bdev = sc->cache_dev->bdev;
 			bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-			sio_set_state(sio, CTE_CLEAN);
-			ssdcache_put_sio(sio);
-			map_context->ptr = NULL;
+			map_context->ptr = sio;
 			return DM_MAPIO_REMAPPED;
 		}
 		map_context->ptr = sio;
@@ -1237,6 +1242,9 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		sio_set_state(sio, CTE_WRITEBACK);
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
 		/* Direct and indirect write completed */
+		sio_set_state(sio, CTE_CLEAN);
+	} else if (sio_is_state(sio, CTE_DIRTY)) {
+		/* Read completed */
 		sio_set_state(sio, CTE_CLEAN);
 	} else if (sio_is_state(sio, CTE_ERROR)) {
 		sio_set_state(sio, CTE_INVALID);
