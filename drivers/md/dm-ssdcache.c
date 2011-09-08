@@ -1124,7 +1124,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		    state_is_error(sc, state)) {
 			sc->cache_busy++;
 			sio_set_state(sio, CTE_ERROR);
-			WPRINTK(sio, "error sequence state %08lx/%08lx",
+			WPRINTK(sio, "cache hit busy state %08lx/%08lx",
 				state, cte_bio_mask(sc, bio));
 			bio->bi_bdev = sc->target_dev->bdev;
 			map_context->ptr = sio;
