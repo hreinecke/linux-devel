@@ -774,42 +774,7 @@ static void finish_reserved(struct ssdcache_io *sio, unsigned long error)
 		/* Release bio */
 		bio_for_each_segment(bvec, sio->bio, i)
 			put_page(bvec->bv_page);
-		bio_put(sio->bio);
-		sio->bio = NULL;
 	}
-
-	ssdcache_put_sio(sio);
-}
-
-static void finish_update(struct ssdcache_io *sio, unsigned long error)
-{
-	if (error) {
-		/* Move back to INVALID */
-		WPRINTK(sio, "error, mark cte invalid");
-		sio_set_state(sio, CTE_INVALID);
-	} else {
-		sio_set_state(sio, CTE_WRITEBACK);
-	}
-	if (sio->bio) {
-		bio_put(sio->bio);
-		sio->bio = NULL;
-	}
-	ssdcache_put_sio(sio);
-}
-
-static void finish_writeback(struct ssdcache_io *sio, unsigned long error)
-{
-	if (error) {
-		WPRINTK(sio, "error, mark cte invalid");
-		sio_set_state(sio, CTE_INVALID);
-	} else {
-		sio_set_state(sio, CTE_CLEAN);
-	}
-	if (sio->bio) {
-		bio_put(sio->bio);
-		sio->bio = NULL;
-	}
-	ssdcache_put_sio(sio);
 }
 
 static void io_callback(unsigned long error, void *context)
@@ -822,29 +787,31 @@ static void io_callback(unsigned long error, void *context)
 	if (sio_is_state(sio, CTE_RESERVED)) {
 		finish_reserved(sio, error);
 	} else if (sio_is_state(sio, CTE_UPDATE)) {
-		finish_update(sio, error);
+		if (error) {
+			/* Move back to INVALID */
+			WPRINTK(sio, "error, mark cte invalid");
+			sio_set_state(sio, CTE_INVALID);
+		} else {
+			sio_set_state(sio, CTE_WRITEBACK);
+		}
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
-		finish_writeback(sio, error);
-	} else if (sio_is_state(sio, CTE_INVALID)) {
-		if (sio->bio)
-			bio_put(sio->bio);
-		ssdcache_put_sio(sio);
+		if (error) {
+			WPRINTK(sio, "error, mark cte invalid");
+			sio_set_state(sio, CTE_INVALID);
+		} else {
+			sio_set_state(sio, CTE_CLEAN);
+		}
 	} else if (sio_is_state(sio, CTE_ERROR)) {
 		sio_set_state(sio, CTE_INVALID);
-		if (sio->bio) {
-			bio_put(sio->bio);
-			sio->bio = NULL;
-		}
-		ssdcache_put_sio(sio);
-	} else {
+	} else  {
 		WPRINTK(sio, "unhandled state %08lx:%08lx",
 			sio_get_state(sio), sio->bio_mask);
-		if (sio->bio) {
-			bio_put(sio->bio);
-			sio->bio = NULL;
-		}
-		ssdcache_put_sio(sio);
 	}
+	if (sio->bio) {
+		bio_put(sio->bio);
+		sio->bio = NULL;
+	}
+	ssdcache_put_sio(sio);
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
