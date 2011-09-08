@@ -253,10 +253,6 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
 {
 	struct ssdcache_md *cmd;
 
-	cmd = cmd_lookup(sc, hash_number);
-	if (cmd)
-		return cmd;
-
 	cmd = mempool_alloc(_cmd_pool, GFP_NOIO | __GFP_ZERO);
 	if (!cmd)
 		return NULL;
@@ -677,7 +673,6 @@ static void cte_start_sequence(struct ssdcache_io *sio, enum cte_state state)
 	if (!newcte)
 		return;
 
-	sio->bio_mask = cte_bio_mask(sio->sc, sio->bio);
 	newstate = sio_update_state(sio, oldstate, state);
 
 	spin_lock_irq(&sio->cmd->lock);
@@ -1057,43 +1052,57 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 		return ssdcache_hash_wrap(sc, sector);
 }
 
-static int cte_match(struct ssdcache_c *sc,
-		     struct ssdcache_md *cmd,
+static int cte_match(struct ssdcache_io *sio,
 		     struct bio *bio)
 {
 	sector_t data_sector;
 	struct ssdcache_te *cte;
+	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
 	int invalid = -1, oldest, i, busy = 0;
 
-	data_sector = cte_bio_align(sc, bio);
+	data_sector = cte_bio_align(sio->sc, bio);
+	hash_number = hash_block(sio->sc, data_sector);
 	oldest_atime = jiffies;
 	oldest_count = -1;
 	oldest = -1;
 
-	for (i = 0; i < cmd->num_cte; i++) {
-		cte = cmd->te[i];
-		if (!cte || cte_is_invalid(sc, cte)) {
+	/* Lookup cmd */
+	sio->cmd = cmd_lookup(sio->sc, hash_number);
+	if (!sio->cmd) {
+		sio->cmd = cmd_insert(sio->sc, hash_number);
+		if (!sio->cmd) {
+			DPRINTK("cmd insertion failure");
+			return -1;
+		} else {
+			/* Clean cmd */
+			return 0;
+		}
+	}
+
+	for (i = 0; i < sio->cmd->num_cte; i++) {
+		cte = sio->cmd->te[i];
+		if (!cte || cte_is_invalid(sio->sc, cte)) {
 			if (invalid < 0)
 				invalid = i;
 			continue;
-		} else if (cte_match_sector(sc, cte, bio)) {
+		} else if (cte_match_sector(sio->sc, cte, bio)) {
 			return i;
 		}
 		/* Break out if we have found an invalid entry */
 		if (invalid != -1)
 			break;
 		/* Can only eject CLEAN entries */
-		if (!cte_is_state(sc, cte, bio, CTE_CLEAN)) {
+		if (!cte_is_state(sio->sc, cte, bio, CTE_CLEAN)) {
 #ifdef SSD_DEBUG
 			DPRINTK("%s: (cte %lx:%x): skip not-clean cte",
-				__FUNCTION__, cmd->hash, i);
+				__FUNCTION__, sio->cmd->hash, i);
 #endif
 			busy++;
 			continue;
 		}
-		if (sc->cache_strategy == CACHE_LRU) {
+		if (sio->sc->cache_strategy == CACHE_LRU) {
 			/* Select the oldest clean entry */
 			rcu_read_lock();
 			cte_atime = rcu_dereference(cte)->atime;
@@ -1114,21 +1123,26 @@ static int cte_match(struct ssdcache_c *sc,
 		}
 	}
 
-	if (invalid != -1)
+	if (invalid != -1) {
+		if (!cte_is_state(sio->sc, cte, bio, CTE_INVALID)) {
+			DPRINTK("%s: (cte %lx:%x): return non-invalid cte",
+				__FUNCTION__, sio->cmd->hash, invalid);
+		}
 		return invalid;
+	}
 
 	if (oldest != -1) {
 #ifdef SSD_DEBUG
 		DPRINTK("%s (cte %lx:%x): drop oldest cte", __FUNCTION__,
-			cmd->hash, oldest);
+			sio->cmd->hash, oldest);
 
 #endif
-		sc->cache_evictions++;
+		sio->sc->cache_evictions++;
 		return oldest;
 	}
 
 	DPRINTK("%s (cte %lx:ff): %d ctes busy", __FUNCTION__,
-		cmd->hash, busy);
+		sio->cmd->hash, busy);
 	return -1;
 }
 
@@ -1137,7 +1151,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 {
 	struct ssdcache_c *sc = ti->private;
 	sector_t offset, data_sector;
-	unsigned long hash_number, state = 0;
+	unsigned long state = 0;
 	struct ssdcache_te *cte;
 	struct ssdcache_io *sio;
 
@@ -1148,7 +1162,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 
 	data_sector = cte_bio_align(sc, bio);
 	offset = cte_bio_offset(sc, bio);
-	hash_number = hash_block(sc, data_sector);
 
 	/* splitting bios is not yet implemented */
 	WARN_ON(bio->bi_size > sc->block_size);
@@ -1167,19 +1180,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		ssdcache_put_sio(sio);
 		return DM_MAPIO_REMAPPED;
 	}
-
-	/* Lookup cmd */
-	sio->cmd = cmd_insert(sc, hash_number);
-	if (!sio->cmd) {
-		DPRINTK("cache insertion failure");
-		sc->cache_bypassed++;
-		bio->bi_bdev = sc->target_dev->bdev;
-		map_context->ptr = NULL;
-		ssdcache_put_sio(sio);
-		return DM_MAPIO_REMAPPED;
-	}
-
-	sio->cte_idx = cte_match(sc, sio->cmd, bio);
+	sio->bio_mask = cte_bio_mask(sio->sc, bio);
+	sio->cte_idx = cte_match(sio, bio);
 	if (sio->cte_idx < 0) {
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
