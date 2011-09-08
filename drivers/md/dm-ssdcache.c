@@ -104,6 +104,7 @@ struct ssdcache_c {
 	unsigned long cache_busy;
 	unsigned long cache_bypassed;
 	unsigned long cache_evictions;
+	unsigned long cache_failures;
 };
 
 struct ssdcache_io {
@@ -494,8 +495,6 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 		WPRINTK(sio, "illegal state transition %08lx:%08lx",
 			oldstate, newstate & sio->bio_mask);
 
-	WPRINTK(sio, "state %08lx:%08lx:%08lx", oldstate,
-		newstate & sio->bio_mask, sio->bio_mask);
 	return (oldstate & ~(sio->bio_mask)) | (newstate & sio->bio_mask);
 }
 
@@ -596,6 +595,21 @@ static bool state_is_error(struct ssdcache_c *sc, unsigned long oldstate)
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> (i * 4)) & 0xF;
 		match += (tmpstate == CTE_ERROR);
+	}
+	return (match > 0);
+}
+
+static bool state_is_clean(struct ssdcache_c *sc, unsigned long oldstate)
+{
+	unsigned long num_sectors;
+	enum cte_state tmpstate;
+	int match = 0, i;
+
+	num_sectors = to_sector(sc->block_size);
+
+	for (i = 0; i < num_sectors; i++) {
+		tmpstate = (oldstate >> (i * 4)) & 0xF;
+		match += (tmpstate == CTE_CLEAN);
 	}
 	return (match > 0);
 }
@@ -927,17 +941,32 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 		return ssdcache_hash_wrap(sc, sector);
 }
 
+static unsigned long rotate(struct ssdcache_c *sc, unsigned long value)
+{
+	unsigned long result, hash_mask;
+
+	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
+	result = (value << 2);
+	result |= (value >> ((sc->hash_bits - sc->hash_shift) - 2));
+	if (value == (result & hash_mask))
+		result++;
+	return result & hash_mask;
+}
+
 static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 {
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
-	int invalid = -1, oldest, i, index = 0, busy = 0;
+	int invalid, oldest, i, index = 0, busy = 0, assoc = 0;
 
 	hash_number = hash_block(sio->sc, data_sector);
+
+retry:
 	oldest_atime = jiffies;
 	oldest_count = -1;
 	oldest = -1;
+	invalid = -1;
 
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
@@ -945,10 +974,13 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 		sio->cmd = cmd_insert(sio->sc, hash_number);
 		if (!sio->cmd) {
 			DPRINTK("cmd insertion failure");
+			sio->sc->cache_failures++;
 			return false;
 		} else {
+#ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:0): use first clean entry",
 				sio->nr, __FUNCTION__, sio->cmd->hash);
+#endif
 			/* Clean cmd, first entry is useable */
 			invalid = 0;
 			/* Skip cte lookup */
@@ -958,6 +990,7 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 
 	for (i = index; i < sio->cmd->num_cte; i++) {
 		struct ssdcache_te *cte;
+		unsigned long cte_state = 0;
 
 		cte = sio->cmd->te[i];
 		if (!cte) {
@@ -969,11 +1002,10 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 		 * No invalid ctes from here on.
 		 */
 		if (cte) {
-			unsigned long cte_state;
-
 			rcu_read_lock();
 			cte_state = rcu_dereference(cte)->state;
 			rcu_read_unlock();
+
 			if (!cte_state)
 				DPRINTK("%lu: %s (cte %lx:%x): invalid cte",
 					sio->nr, __FUNCTION__,
@@ -981,8 +1013,12 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 			BUG_ON(!cte_state);
 		}
 		if (match_sector(sio->sc, sio->cmd, i, sio->bio)) {
+#ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:%x): matching cte", sio->nr,
 				__FUNCTION__, sio->cmd->hash, i);
+#endif
+			BUG_ON(!cte_is_state(sio->sc, cte, sio->bio, CTE_CLEAN) &&
+			       !cte_is_state(sio->sc, cte, sio->bio, CTE_INVALID));
 			sio->cte_idx = i;
 			sio_set_state(sio, CTE_DIRTY);
 			return true;
@@ -991,7 +1027,7 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 		if (invalid != -1)
 			break;
 		/* Can only eject CLEAN entries */
-		if (!cte_is_state(sio->sc, cte, sio->bio, CTE_CLEAN)) {
+		if (!state_is_clean(sio->sc, cte_state)) {
 #ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:%x): skip not-clean cte",
 				sio->nr, __FUNCTION__, sio->cmd->hash, i);
@@ -1020,14 +1056,22 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 		}
 	}
 found:
-	if (invalid != -1)
+	if (invalid != -1) {
 		index = invalid;
-	else if (oldest != -1) {
+	} else if (assoc > 0) {
+		hash_number = rotate(sio->sc, hash_number);
+		assoc--;
+#ifdef SSD_DEBUG
+		DPRINTK("%s (cte %lx:ff): retry with assoc %d", __FUNCTION__,
+			sio->cmd->hash, assoc);
+#endif
+		goto retry;
+	} else if (oldest != -1) {
 #ifdef SSD_DEBUG
 		DPRINTK("%s (cte %lx:%x): drop oldest cte", __FUNCTION__,
 			sio->cmd->hash, oldest);
-
 #endif
+		sio->sc->cache_evictions++;
 		index = oldest;
 	} else
 		index = -1;
@@ -1046,10 +1090,11 @@ found:
 		spin_unlock_irq(&sio->cmd->lock);
 		if (oldcte)
 			call_rcu(&oldcte->rcu, cte_reset);
-		return index;
 	} else {
-		DPRINTK("%s (cte %lx:ff): %d ctes busy", __FUNCTION__,
-			sio->cmd->hash, busy);
+#ifdef SSD_DEBUG
+		DPRINTK("%lu: %s (cte %lx:ff): %d ctes busy", sio->nr,
+			__FUNCTION__, sio->cmd->hash, busy);
+#endif
 		sio->cte_idx = index;
 	}
 	return false;
@@ -1083,7 +1128,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio = ssdcache_create_sio(sc);
 	if (!sio) {
 		DPRINTK("sio creation failure");
-		sc->cache_bypassed++;
+		sio->sc->cache_failures++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		ssdcache_put_sio(sio);
 		return DM_MAPIO_REMAPPED;
@@ -1395,11 +1440,12 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
 			 "cache misses %lu hits %lu busy %lu "
-			 "bypassed %lu evicts %lu",
+			 "bypassed %lu evicts %lu failures %lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
-			 sc->cache_bypassed, sc->cache_evictions);
+			 sc->cache_bypassed, sc->cache_evictions,
+			 sc->cache_failures);
 		break;
 
 	case STATUSTYPE_TABLE:
