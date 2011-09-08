@@ -584,6 +584,24 @@ static bool state_is_busy(struct ssdcache_c *sc, struct bio * bio,
 	return (match > 0);
 }
 
+static bool state_is_inactive(struct ssdcache_c *sc, struct bio * bio,
+			   unsigned long oldstate)
+{
+	unsigned long offset, num_sectors;
+	enum cte_state tmpstate;
+	int match = 0, i;
+
+	num_sectors = to_sector(bio->bi_size);
+	offset= cte_bio_offset(sc, bio);
+
+	for (i = 0; i < num_sectors; i++) {
+		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
+		match += ((tmpstate == CTE_CLEAN) ||
+			  (tmpstate == CTE_INVALID));
+	}
+	return (match > 0);
+}
+
 static bool state_is_error(struct ssdcache_c *sc, unsigned long oldstate)
 {
 	unsigned long num_sectors;
@@ -965,7 +983,7 @@ static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
-	int invalid, oldest, i, index, busy = 0, assoc = 0;
+	int invalid, oldest, i, index, busy = 0, assoc = 1;
 
 	hash_number = hash_block(sio->sc, data_sector);
 
@@ -1005,30 +1023,34 @@ retry:
 			if (invalid < 0)
 				invalid = i;
 			continue;
-		}
-		/* Safeguard:
-		 * No invalid ctes from here on.
-		 */
-		if (cte) {
+		} else {
+			/*
+			 * Safeguard:
+			 * No invalid ctes from here on.
+			 */
 			rcu_read_lock();
 			cte_state = rcu_dereference(cte)->state;
 			rcu_read_unlock();
 
-			if (!cte_state)
+			if (!cte_state) {
 				DPRINTK("%lu: %s (cte %lx:%x): invalid cte",
 					sio->nr, __FUNCTION__,
 					sio->cmd->hash, i);
-			BUG_ON(!cte_state);
+			}
 		}
 		if (match_sector(sio->sc, sio->cmd, i, sio->bio)) {
 #ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:%x): matching cte", sio->nr,
 				__FUNCTION__, sio->cmd->hash, i);
 #endif
-			BUG_ON(!cte_is_state(sio->sc, cte, sio->bio, CTE_CLEAN) &&
-			       !cte_is_state(sio->sc, cte, sio->bio, CTE_INVALID));
 			sio->cte_idx = i;
-			sio_set_state(sio, CTE_DIRTY);
+			if (!state_is_inactive(sio->sc, sio->bio, cte_state)) {
+				DPRINTK("%lu: %s (cte %lx:%x): matching busy "
+					"cte %08lx", sio->nr, __FUNCTION__,
+					sio->cmd->hash, i, cte_state);
+			} else {
+				sio_set_state(sio, CTE_DIRTY);
+			}
 			return true;
 		}
 		/* Break out if we have found an invalid entry */
@@ -1064,9 +1086,7 @@ retry:
 		}
 	}
 found:
-	if (invalid != -1) {
-		index = invalid;
-	} else if (assoc > 0) {
+	if (invalid < 0 && assoc > 0) {
 		hash_number = rotate(sio->sc, hash_number);
 		assoc--;
 #ifdef SSD_DEBUG
@@ -1074,6 +1094,9 @@ found:
 			sio->cmd->hash, assoc);
 #endif
 		goto retry;
+	}
+	if (invalid != -1) {
+		index = invalid;
 	} else if (oldest != -1) {
 #ifdef SSD_DEBUG
 		DPRINTK("%s (cte %lx:%x): drop oldest cte", __FUNCTION__,
@@ -1103,7 +1126,7 @@ found:
 		DPRINTK("%lu: %s (cte %lx:ff): %d ctes busy", sio->nr,
 			__FUNCTION__, sio->cmd->hash, busy);
 #endif
-		sio->cte_idx = index;
+		sio->cte_idx = -1;
 	}
 	return false;
 }
@@ -1179,7 +1202,16 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)data_sector, state,
 			cte_bio_mask(sc, bio));
 #endif
-		BUG_ON(!sio_is_state(sio, CTE_DIRTY));
+		if (!sio_is_state(sio, CTE_DIRTY) ||
+		    state_is_error(sc, state)) {
+			sc->cache_busy++;
+			WPRINTK(sio, "cache miss busy state %08lx/%08lx",
+				state, cte_bio_mask(sc, bio));
+			sio_set_state(sio, CTE_ERROR);
+			bio->bi_bdev = sc->target_dev->bdev;
+			map_context->ptr = sio;
+			return DM_MAPIO_REMAPPED;
+		}
 		bio_get(bio);
 		map_context->ptr = sio;
 		if (bio_data_dir(bio) == READ) {
