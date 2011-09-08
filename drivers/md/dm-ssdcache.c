@@ -758,7 +758,7 @@ static void do_sio(struct work_struct *ignored)
  * Data has been written to cache device.
  * Finish I/O and complete sio item.
  */
-static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
+static void finish_reserved(struct ssdcache_io *sio, unsigned long error)
 {
 	int i;
 	struct bio_vec *bvec;
@@ -779,10 +779,9 @@ static int finish_reserved(struct ssdcache_io *sio, unsigned long error)
 	}
 
 	ssdcache_put_sio(sio);
-	return 0;
 }
 
-static int finish_update(struct ssdcache_io *sio, unsigned long error)
+static void finish_update(struct ssdcache_io *sio, unsigned long error)
 {
 	if (error) {
 		/* Move back to INVALID */
@@ -796,10 +795,9 @@ static int finish_update(struct ssdcache_io *sio, unsigned long error)
 		sio->bio = NULL;
 	}
 	ssdcache_put_sio(sio);
-	return 0;
 }
 
-static int finish_writeback(struct ssdcache_io *sio, unsigned long error)
+static void finish_writeback(struct ssdcache_io *sio, unsigned long error)
 {
 	if (error) {
 		WPRINTK(sio, "error, mark cte invalid");
@@ -812,23 +810,21 @@ static int finish_writeback(struct ssdcache_io *sio, unsigned long error)
 		sio->bio = NULL;
 	}
 	ssdcache_put_sio(sio);
-	return 0;
 }
 
 static void io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
-	int requeue = 0;
 
 	if (error)
 		WPRINTK(sio, "finished with %lu", error);
 
 	if (sio_is_state(sio, CTE_RESERVED)) {
-		requeue = finish_reserved(sio, error);
+		finish_reserved(sio, error);
 	} else if (sio_is_state(sio, CTE_UPDATE)) {
-		requeue = finish_update(sio, error);
+		finish_update(sio, error);
 	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
-		requeue = finish_writeback(sio, error);
+		finish_writeback(sio, error);
 	} else if (sio_is_state(sio, CTE_INVALID)) {
 		if (sio->bio)
 			bio_put(sio->bio);
@@ -849,11 +845,7 @@ static void io_callback(unsigned long error, void *context)
 		}
 		ssdcache_put_sio(sio);
 	}
-	if (requeue) {
-		ssdcache_schedule_sio(sio);
-	} else {
-		queue_work(_ssdcached_wq, &_ssdcached_work);
-	}
+	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
 static inline sector_t to_cache_sector(struct ssdcache_io *sio,
