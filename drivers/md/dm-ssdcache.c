@@ -869,11 +869,9 @@ static int do_io(struct ssdcache_io *sio)
 		/* Start writing to cache device */
 		write_to_cache(sio);
 		return 0;
-	} else if (sio_is_state(sio, CTE_CLEAN)) {
-		return 0;
 	}
 	WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
-	return EINVAL;
+	return 0;
 }
 
 /*
