@@ -1029,7 +1029,6 @@ retry:
 			}
 		}
 	}
-found:
 	if (invalid < 0 && assoc > 0) {
 		hash_number = rotate(sio->sc, hash_number);
 		assoc--;
@@ -1039,6 +1038,7 @@ found:
 #endif
 		goto retry;
 	}
+found:
 	if (invalid != -1) {
 		index = invalid;
 	} else if (oldest != -1) {
