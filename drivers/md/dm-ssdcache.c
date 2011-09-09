@@ -311,8 +311,9 @@ const char *cte_state_name(enum cte_state state)
 	return name;
 }
 
-#define cte_bio_align(s,b) ((b)->bi_sector & ~s->block_mask)
-#define cte_bio_offset(s,b) ((b)->bi_sector & s->block_mask)
+#define cte_bio_align(s,b) ((b)->bi_sector & ~(s)->block_mask)
+#define cte_bio_offset(s,b) ((b)->bi_sector & (s)->block_mask)
+#define cte_state_mask(s) ((1UL << (to_sector((s)->block_size) * 4)) - 1)
 
 static unsigned long cte_bio_mask(struct ssdcache_ctx *sc, struct bio *bio)
 {
@@ -504,11 +505,14 @@ static unsigned long sio_get_state(struct ssdcache_io *sio)
 	struct ssdcache_te *cte;
 
 	rcu_read_lock();
-	BUG_ON(sio->cte_idx < 0);
 	if (sio) {
-		cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
-		if (cte)
-			state = cte->state;
+		if (sio->cte_idx != -1) {
+			cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
+			if (cte)
+				state = cte->state;
+		} else {
+			WPRINTK(sio, "invalid index");
+		}
 	}
 	rcu_read_unlock();
 
@@ -540,7 +544,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 	newstate = sio_update_state(sio, oldstate, state);
 
 	/* Check if we should drop the old cte */
-	if ((newstate & sio->sc->block_mask) != 0 ) {
+	if ((newstate & cte_state_mask(sio->sc)) != 0 ) {
 		/* cte still valid */
 		newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
 		if (!newcte)
@@ -584,6 +588,17 @@ static bool state_is_busy(struct ssdcache_ctx *sc, struct bio * bio,
 	return (match > 0);
 }
 
+static bool state_match(struct ssdcache_ctx *sc, unsigned long oldstate,
+		     enum cte_state state)
+{
+	unsigned long tmpstate, cte_mask = cte_state_mask(sc);
+	unsigned char numstate = state | (state << 4);
+
+	memset(&tmpstate, numstate, sizeof(unsigned long));
+
+	return ((tmpstate & cte_mask) == (oldstate & cte_mask));
+}
+
 static bool state_is_inactive(struct ssdcache_ctx *sc, struct bio * bio,
 			   unsigned long oldstate)
 {
@@ -604,32 +619,12 @@ static bool state_is_inactive(struct ssdcache_ctx *sc, struct bio * bio,
 
 static bool state_is_error(struct ssdcache_ctx *sc, unsigned long oldstate)
 {
-	unsigned long num_sectors;
-	enum cte_state tmpstate;
-	int match = 0, i;
-
-	num_sectors = to_sector(sc->block_size);
-
-	for (i = 0; i < num_sectors; i++) {
-		tmpstate = (oldstate >> (i * 4)) & 0xF;
-		match += (tmpstate == CTE_ERROR);
-	}
-	return (match > 0);
+	return state_match(sc, oldstate, CTE_ERROR);
 }
 
 static bool state_is_clean(struct ssdcache_ctx *sc, unsigned long oldstate)
 {
-	unsigned long num_sectors;
-	enum cte_state tmpstate;
-	int match = 0, i;
-
-	num_sectors = to_sector(sc->block_size);
-
-	for (i = 0; i < num_sectors; i++) {
-		tmpstate = (oldstate >> (i * 4)) & 0xF;
-		match += (tmpstate == CTE_CLEAN);
-	}
-	return (match > 0);
+	return state_match(sc, oldstate, CTE_CLEAN);
 }
 
 static bool match_sector(struct ssdcache_ctx *sc,
@@ -1060,7 +1055,7 @@ found:
 		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
 		newcte->state = sio_update_state(sio, 0, CTE_DIRTY);
-		newcte->sector = cte_bio_align(sio->sc, sio->bio);
+		newcte->sector = data_sector;
 		rcu_assign_pointer(sio->cmd->te[index], newcte);
 		spin_unlock_irq(&sio->cmd->lock);
 		if (oldcte)
