@@ -623,7 +623,7 @@ static bool state_is_clean(struct ssdcache_ctx *sc, unsigned long oldstate)
 static bool match_sector(struct ssdcache_ctx *sc,
 			 struct ssdcache_md *cmd,
 			 unsigned long index,
-			 struct bio *bio)
+			 sector_t data_sector)
 {
 	bool match = false;
 	unsigned long oldstate;
@@ -638,7 +638,7 @@ static bool match_sector(struct ssdcache_ctx *sc,
 	oldstate = rcu_dereference(cmd->te[index])->state;
 	rcu_read_unlock();
 	if (oldstate != 0)
-		match = (cte_bio_align(sc, bio) == sector);
+		match = (data_sector == sector);
 
 	return match;
 }
@@ -969,7 +969,7 @@ retry:
 					sio->cmd->hash, i);
 			}
 		}
-		if (match_sector(sio->sc, sio->cmd, i, sio->bio)) {
+		if (match_sector(sio->sc, sio->cmd, i, data_sector)) {
 #ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:%x): matching cte", sio->nr,
 				__FUNCTION__, sio->cmd->hash, i);
