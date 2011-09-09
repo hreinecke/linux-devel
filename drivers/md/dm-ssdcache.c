@@ -1072,6 +1072,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 
 	if (bio->bi_rw & REQ_FLUSH) {
 		bio->bi_bdev = sc->target_dev->bdev;
+		map_context->ptr = NULL;
 		return DM_MAPIO_REMAPPED;
 	}
 
@@ -1079,11 +1080,19 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	offset = cte_bio_offset(sc, bio);
 
 	/* splitting bios is not yet implemented */
-	WARN_ON(bio->bi_size > sc->block_size);
+	if (bio->bi_size > sc->block_size) {
+		DPRINTK("bio size %u larger than block size", bio->bi_size);
+		sc->cache_bypassed++;
+		bio->bi_bdev = sc->target_dev->bdev;
+		map_context->ptr = NULL;
+		return DM_MAPIO_REMAPPED;
+	}
 
 	if (bio->bi_size == 0) {
 		DPRINTK("zero-sized bio (flags %lx)", bio->bi_flags);
+		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
+		map_context->ptr = NULL;
 		return DM_MAPIO_REMAPPED;
 	}
 
