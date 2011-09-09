@@ -809,15 +809,14 @@ static inline sector_t to_cache_sector(struct ssdcache_io *sio,
 	return cache_sector;
 }
 
-static void write_to_cache(struct ssdcache_io *sio)
+static void write_to_cache(struct ssdcache_io *sio, struct bio *bio)
 {
 	struct dm_io_region cache;
 	struct dm_io_request iorq;
-	struct bio *bio = sio->bio;
 
 	cache.bdev = sio->sc->cache_dev->bdev;
 	cache.sector = to_cache_sector(sio, bio->bi_sector);
-	cache.count = to_sector(sio->bio->bi_size);
+	cache.count = to_sector(bio->bi_size);
 
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
@@ -829,18 +828,18 @@ static void write_to_cache(struct ssdcache_io *sio)
 	dm_io(&iorq, 1, &cache, NULL);
 }
 
-static void write_to_target(struct ssdcache_io *sio)
+static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 {
 	struct dm_io_region target;
 	struct dm_io_request iorq;
 
 	target.bdev = sio->sc->target_dev->bdev;
-	target.sector = sio->bio->bi_sector;
-	target.count = to_sector(sio->bio->bi_size);
+	target.sector = bio->bi_sector;
+	target.count = to_sector(bio->bi_size);
 
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = sio->bio->bi_io_vec + sio->bio->bi_idx;
+	iorq.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx;
 	iorq.notify.fn = io_callback;
 	iorq.notify.context = sio;
 	iorq.client = sio->sc->iocp;
@@ -855,7 +854,7 @@ static int do_io(struct ssdcache_io *sio)
 	BUG_ON(bio_data_dir(sio->bio) == READ);
 	if (sio_is_state(sio, CTE_RESERVED)) {
 		/* Start writing to cache device */
-		write_to_cache(sio);
+		write_to_cache(sio, sio->bio);
 		return 0;
 	}
 	WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
@@ -1163,11 +1162,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio_set_state(sio, CTE_UPDATE);
 	if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 		bio->bi_bdev = sc->target_dev->bdev;
-		write_to_cache(sio);
+		write_to_cache(sio, bio);
 	} else {
 		bio->bi_bdev = sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-		write_to_target(sio);
+		write_to_target(sio, bio);
 	}
 	return DM_MAPIO_REMAPPED;
 }
