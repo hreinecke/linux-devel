@@ -152,11 +152,6 @@ enum cte_state {
 	CTE_ERROR,      /* Sector valid, error during processing */
 };
 
-/* Cache table entry state encoding */
-#define CTE_STATE_SHIFT 48
-#define CTE_SECTOR_MASK ~(1ULL << CTE_STATE_SHIFT)
-#define CTE_STATE_MASK (0xFFULL << CTE_STATE_SHIFT)
-
 static int do_io(struct ssdcache_io *sio);
 
 /*
@@ -1342,6 +1337,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->num_flush_requests = 1;
 	ti->num_discard_requests = 1;
 	ti->private = sc;
+	ti->split_io = to_sector(sc->block_size);
 	return 0;
 
 bad_io_client:
