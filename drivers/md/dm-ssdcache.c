@@ -85,7 +85,7 @@ struct ssdcache_md {
 	struct ssdcache_te *te[DEFAULT_ASSOCIATIVITY];	/* RCU Table entries */
 };
 
-struct ssdcache_c {
+struct ssdcache_ctx {
 	struct dm_dev *target_dev;
 	struct dm_dev *cache_dev;
 	struct dm_io_client *iocp;
@@ -111,7 +111,7 @@ struct ssdcache_io {
 	struct list_head list;
 	struct kref kref;
 	unsigned long nr;
-	struct ssdcache_c *sc;
+	struct ssdcache_ctx *sc;
 	struct ssdcache_md *cmd;
 	long cte_idx;
 	struct bio *bio;
@@ -238,7 +238,7 @@ static void pool_exit(void)
  * cache metadirectory handling
  */
 
-static inline struct ssdcache_md *cmd_lookup(struct ssdcache_c *sc,
+static inline struct ssdcache_md *cmd_lookup(struct ssdcache_ctx *sc,
 					     unsigned long hash_number)
 {
 	struct ssdcache_md *cmd;
@@ -249,7 +249,7 @@ static inline struct ssdcache_md *cmd_lookup(struct ssdcache_c *sc,
 	return cmd;
 }
 
-static inline struct ssdcache_md *cmd_insert(struct ssdcache_c *sc,
+static inline struct ssdcache_md *cmd_insert(struct ssdcache_ctx *sc,
 					     unsigned long hash_number)
 {
 	struct ssdcache_md *cmd;
@@ -314,7 +314,7 @@ const char *cte_state_name(enum cte_state state)
 #define cte_bio_align(s,b) ((b)->bi_sector & ~s->block_mask)
 #define cte_bio_offset(s,b) ((b)->bi_sector & s->block_mask)
 
-static unsigned long cte_bio_mask(struct ssdcache_c *sc, struct bio *bio)
+static unsigned long cte_bio_mask(struct ssdcache_ctx *sc, struct bio *bio)
 {
 	unsigned long mask = 0;
 	int i;
@@ -331,7 +331,7 @@ static unsigned long cte_bio_mask(struct ssdcache_c *sc, struct bio *bio)
 	return mask;
 }
 
-struct ssdcache_te * cte_new(struct ssdcache_c *sc, struct ssdcache_md *cmd,
+struct ssdcache_te * cte_new(struct ssdcache_ctx *sc, struct ssdcache_md *cmd,
 			     unsigned int index)
 {
 	struct ssdcache_te *newcte;
@@ -356,7 +356,7 @@ static void cte_reset(struct rcu_head *rp)
 	mempool_free(cte, _cte_pool);
 }
 
-static inline bool cte_is_state(struct ssdcache_c *sc, struct ssdcache_te *cte,
+static inline bool cte_is_state(struct ssdcache_ctx *sc, struct ssdcache_te *cte,
 				struct bio *bio, enum cte_state state)
 {
 	unsigned long oldstate;
@@ -562,7 +562,7 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
-static bool state_is_busy(struct ssdcache_c *sc, struct bio * bio,
+static bool state_is_busy(struct ssdcache_ctx *sc, struct bio * bio,
 			  unsigned long oldstate)
 {
 	unsigned long offset, num_sectors;
@@ -584,7 +584,7 @@ static bool state_is_busy(struct ssdcache_c *sc, struct bio * bio,
 	return (match > 0);
 }
 
-static bool state_is_inactive(struct ssdcache_c *sc, struct bio * bio,
+static bool state_is_inactive(struct ssdcache_ctx *sc, struct bio * bio,
 			   unsigned long oldstate)
 {
 	unsigned long offset, num_sectors;
@@ -602,7 +602,7 @@ static bool state_is_inactive(struct ssdcache_c *sc, struct bio * bio,
 	return (match > 0);
 }
 
-static bool state_is_error(struct ssdcache_c *sc, unsigned long oldstate)
+static bool state_is_error(struct ssdcache_ctx *sc, unsigned long oldstate)
 {
 	unsigned long num_sectors;
 	enum cte_state tmpstate;
@@ -617,7 +617,7 @@ static bool state_is_error(struct ssdcache_c *sc, unsigned long oldstate)
 	return (match > 0);
 }
 
-static bool state_is_clean(struct ssdcache_c *sc, unsigned long oldstate)
+static bool state_is_clean(struct ssdcache_ctx *sc, unsigned long oldstate)
 {
 	unsigned long num_sectors;
 	enum cte_state tmpstate;
@@ -632,7 +632,7 @@ static bool state_is_clean(struct ssdcache_c *sc, unsigned long oldstate)
 	return (match > 0);
 }
 
-static bool match_sector(struct ssdcache_c *sc,
+static bool match_sector(struct ssdcache_ctx *sc,
 			 struct ssdcache_md *cmd,
 			 unsigned long index,
 			 struct bio *bio)
@@ -659,7 +659,7 @@ static bool match_sector(struct ssdcache_c *sc,
  * Workqueue handling
  */
 
-static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_c *sc)
+static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_ctx *sc)
 {
 	struct ssdcache_io *sio;
 
@@ -878,7 +878,7 @@ static int do_io(struct ssdcache_io *sio)
  * Cache lookup and I/O handling
  */
 
-static unsigned long ssdcache_hash_64(struct ssdcache_c *sc, sector_t sector)
+static unsigned long ssdcache_hash_64(struct ssdcache_ctx *sc, sector_t sector)
 {
 	unsigned long value, hash_number, offset, hash_mask, sector_shift;
 
@@ -891,7 +891,7 @@ static unsigned long ssdcache_hash_64(struct ssdcache_c *sc, sector_t sector)
 	return (hash_number << sc->hash_shift) | offset;
 }
 
-static unsigned long ssdcache_hash_wrap(struct ssdcache_c *sc, sector_t sector)
+static unsigned long ssdcache_hash_wrap(struct ssdcache_ctx *sc, sector_t sector)
 {
 	unsigned long sector_shift, value, hash_mask;
 
@@ -902,7 +902,7 @@ static unsigned long ssdcache_hash_wrap(struct ssdcache_c *sc, sector_t sector)
 	return value & hash_mask;
 }
 
-static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
+static unsigned long hash_block(struct ssdcache_ctx *sc, sector_t sector)
 {
 	if (default_cache_algorithm == CACHE_ALG_HASH64)
 		return ssdcache_hash_64(sc, sector);
@@ -910,7 +910,7 @@ static unsigned long hash_block(struct ssdcache_c *sc, sector_t sector)
 		return ssdcache_hash_wrap(sc, sector);
 }
 
-static unsigned long rotate(struct ssdcache_c *sc, unsigned long value)
+static unsigned long rotate(struct ssdcache_ctx *sc, unsigned long value)
 {
 	unsigned long result, hash_mask;
 
@@ -1078,7 +1078,7 @@ found:
 static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
 {
-	struct ssdcache_c *sc = ti->private;
+	struct ssdcache_ctx *sc = ti->private;
 	sector_t offset, data_sector;
 	unsigned long state = 0;
 	struct ssdcache_io *sio;
@@ -1245,7 +1245,7 @@ finish:
  */
 static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
-	struct ssdcache_c *sc;
+	struct ssdcache_ctx *sc;
 	unsigned long num_cte;
 	unsigned long cdev_size;
 	unsigned long long tdev_size;
@@ -1362,7 +1362,7 @@ bad:
 
 static void ssdcache_dtr(struct dm_target *ti)
 {
-	struct ssdcache_c *sc = (struct ssdcache_c *) ti->private;
+	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
 	struct ssdcache_te *cte;
 	unsigned long pos = 0, nr_cmds;
 	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
@@ -1401,7 +1401,7 @@ static void ssdcache_dtr(struct dm_target *ti)
 static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			 char *result, unsigned int maxlen)
 {
-	struct ssdcache_c *sc = (struct ssdcache_c *) ti->private;
+	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
 	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
 	unsigned long nr_elems, nr_cmds = 0, nr_ctes = 0, pos = 0;
 	int i, j;
@@ -1450,7 +1450,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 static int ssdcache_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 			struct bio_vec *biovec, int max_size)
 {
-	struct ssdcache_c *sc = ti->private;
+	struct ssdcache_ctx *sc = ti->private;
 	struct request_queue *q = bdev_get_queue(sc->target_dev->bdev);
 
 	if (!q->merge_bvec_fn)
@@ -1465,7 +1465,7 @@ static int ssdcache_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 static int ssdcache_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
-	struct ssdcache_c *sc = ti->private;
+	struct ssdcache_ctx *sc = ti->private;
 
 	return fn(ti, sc->target_dev, 0, ti->len, data);
 }
