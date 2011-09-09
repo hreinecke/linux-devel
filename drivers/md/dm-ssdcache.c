@@ -40,7 +40,7 @@
 #define DEFAULT_CTE_NUM 4096
 
 #define DEFAULT_BLOCKSIZE	4096
-#define DEFAULT_ASSOCIATIVITY	32
+#define DEFAULT_ASSOCIATIVITY	64
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -579,11 +579,9 @@ static bool state_is_busy(struct ssdcache_ctx *sc, struct bio * bio,
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
 		match += (tmpstate == CTE_PREFETCH);
-		if (bio_data_dir(bio) == READ)
-			match += ((tmpstate == CTE_UPDATE) ||
-				  (tmpstate == CTE_WRITEBACK));
-		else
-			match += (tmpstate == CTE_RESERVED);
+		match += ((tmpstate == CTE_UPDATE) ||
+			  (tmpstate == CTE_WRITEBACK));
+		match += (tmpstate == CTE_RESERVED);
 	}
 	return (match > 0);
 }
