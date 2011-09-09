@@ -1112,15 +1112,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #ifdef SSD_DEBUG
 		WPRINTK(sio, "%s hit %llx state %08lx/%08lx",
 			bio_data_dir(bio) == READ ? "read" : "write",
-			(unsigned long long)data_sector, state,
-			cte_bio_mask(sc, bio));
+			(unsigned long long)data_sector, state, sio->bio_mask);
 #endif
 		if (state_is_busy(sc, bio, state) ||
 		    state_is_error(sc, state)) {
 			sc->cache_busy++;
 			sio_set_state(sio, CTE_ERROR);
 			WPRINTK(sio, "cache hit busy state %08lx/%08lx",
-				state, cte_bio_mask(sc, bio));
+				state, sio->bio_mask);
 			bio->bi_bdev = sc->target_dev->bdev;
 			map_context->ptr = sio;
 			return DM_MAPIO_REMAPPED;
@@ -1139,13 +1138,13 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		WPRINTK(sio, "%s miss %llx state %08lx/%08lx",
 			bio_data_dir(bio) == READ ? "read" : "write",
 			(unsigned long long)data_sector, state,
-			cte_bio_mask(sc, bio));
+			sio->bio_mask);
 #endif
 		if (!sio_is_state(sio, CTE_DIRTY) ||
 		    state_is_error(sc, state)) {
 			sc->cache_busy++;
 			WPRINTK(sio, "cache miss busy state %08lx/%08lx",
-				state, cte_bio_mask(sc, bio));
+				state, sio->bio_mask);
 			sio_set_state(sio, CTE_ERROR);
 			bio->bi_bdev = sc->target_dev->bdev;
 			map_context->ptr = sio;
