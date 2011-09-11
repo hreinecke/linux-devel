@@ -116,6 +116,7 @@ struct ssdcache_io {
 	long cte_idx;
 	struct bio *bio;
 	unsigned long bio_mask;
+	unsigned long error;
 };
 
 static DEFINE_SPINLOCK(_work_lock);
@@ -762,8 +763,9 @@ static void io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	if (error) {
+	if (error || sio->error) {
 		WPRINTK(sio, "finished with %lu", error);
+		sio->error = error;
 		sio_set_state(sio, CTE_INVALID);
 		goto out;
 	}
@@ -1191,8 +1193,9 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	if (!sio)
 		return 0;
 
-	if (error) {
+	if (error || sio->error) {
 		WPRINTK(sio, "finished with %u", error);
+		sio->error = error;
 		if (sio_is_state(sio, CTE_PREFETCH))
 			bio_put(sio->bio);
 		sio_set_state(sio, CTE_INVALID);
