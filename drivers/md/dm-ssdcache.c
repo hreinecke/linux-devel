@@ -622,17 +622,14 @@ static bool match_sector(struct ssdcache_ctx *sc,
 	unsigned long oldstate;
 	sector_t sector;
 
-	BUG_ON(!cmd);
-	BUG_ON(index == (unsigned long)-1);
-
 	rcu_read_lock();
-	BUG_ON(!cmd->te[index]);
-	sector = rcu_dereference(cmd->te[index])->sector;
-	oldstate = rcu_dereference(cmd->te[index])->state;
-	rcu_read_unlock();
-	if (oldstate != 0)
-		match = (data_sector == sector);
-
+	if (cmd && index != -1 && cmd->te[index]) {
+		sector = rcu_dereference(cmd->te[index])->sector;
+		oldstate = rcu_dereference(cmd->te[index])->state;
+		rcu_read_unlock();
+		if (oldstate != 0)
+			match = (data_sector == sector);
+	}
 	return match;
 }
 
