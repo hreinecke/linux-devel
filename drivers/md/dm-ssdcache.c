@@ -301,7 +301,7 @@ const char *cte_state_name(enum cte_state state)
 
 #define cte_bio_align(s,b) ((b)->bi_sector & ~(s)->block_mask)
 #define cte_bio_offset(s,b) ((b)->bi_sector & (s)->block_mask)
-#define cte_state_mask(s) ((1UL << (to_sector((s)->block_size) * 4)) - 1)
+#define cte_state_mask(s) ((1UL << (((s)->block_size) * 4)) - 1)
 
 static unsigned long cte_bio_mask(struct ssdcache_ctx *sc, struct bio *bio)
 {
@@ -310,7 +310,7 @@ static unsigned long cte_bio_mask(struct ssdcache_ctx *sc, struct bio *bio)
 
 	BUG_ON(!bio);
 
-	for (i = 0; i < to_sector(sc->block_size); i++) {
+	for (i = 0; i < sc->block_size; i++) {
 		if (i >= cte_bio_offset(sc, bio) &&
 		    i < cte_bio_offset(sc, bio) + to_sector(bio->bi_size)) {
 			mask |= (0xFUL << (i * 4));
@@ -333,7 +333,6 @@ struct ssdcache_te * cte_new(struct ssdcache_ctx *sc, struct ssdcache_md *cmd,
 	newcte->atime = jiffies;
 	newcte->count = 1;
 	newcte->md = cmd;
-
 	return newcte;
 }
 
@@ -421,7 +420,7 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 	int i, illegal = 0;
 	enum cte_state tmpstate;
 
-	for (i = 0; i < to_sector(sio->sc->block_size); i++) {
+	for (i = 0; i < sio->sc->block_size; i++) {
 		state_shift = (i * 4);
 		tmpmask = (sio->bio_mask >> state_shift) & 0xF;
 		if (tmpmask == 0xF) {
@@ -765,8 +764,8 @@ static inline sector_t to_cache_sector(struct ssdcache_io *sio,
 	sector_offset = data_sector & sio->sc->block_mask;
 
 	BUG_ON(sio->cte_idx < 0);
-	cte_offset = to_sector(sio->cte_idx * sio->sc->block_size);
-	cmd_offset = to_sector(sio->cmd->hash * sio->cmd->num_cte * sio->sc->block_size);
+	cte_offset = to_sector(sio->cte_idx) * sio->sc->block_size;
+	cmd_offset = to_sector(sio->cmd->hash * sio->cmd->num_cte) * sio->sc->block_size;
 	cache_sector = sio->sc->data_offset + cmd_offset + cte_offset + sector_offset;
 
 	if (cache_sector > i_size_read(sio->sc->cache_dev->bdev->bd_inode)) {
@@ -833,7 +832,7 @@ static unsigned long ssdcache_hash_64(struct ssdcache_ctx *sc, sector_t sector)
 {
 	unsigned long value, hash_number, offset, hash_mask, sector_shift;
 
-	sector_shift = fls(sc->block_size / 512) - 1;
+	sector_shift = fls(sc->block_size) - 1;
 	hash_mask = (1UL << sc->hash_shift) - 1;
 	value = sector >> (sc->hash_shift + sector_shift);
 	offset = sector & hash_mask;
@@ -846,7 +845,7 @@ static unsigned long ssdcache_hash_wrap(struct ssdcache_ctx *sc, sector_t sector
 {
 	unsigned long sector_shift, value, hash_mask;
 
-	sector_shift = fls(sc->block_size/ 512) - 1;
+	sector_shift = fls(sc->block_size) - 1;
 	value = sector >> (sc->hash_shift + sector_shift);
 	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
 
@@ -1055,7 +1054,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	offset = cte_bio_offset(sc, bio);
 
 	/* splitting bios is not yet implemented */
-	if (bio->bi_size > sc->block_size) {
+	if (bio->bi_size > to_bytes(sc->block_size)) {
 		DPRINTK("bio size %u larger than block size", bio->bi_size);
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
@@ -1236,14 +1235,14 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (argc >= 3) {
 		if (sscanf(argv[2], "%lu", &sc->block_size) != 1) {
 			ti->error = "dm-ssdcache: Invalid blocksize";
-			sc->block_size = DEFAULT_BLOCKSIZE;
+			sc->block_size = to_sector(DEFAULT_BLOCKSIZE);
 		}
-		if (sc->block_size < 512) {
+		if (sc->block_size < 1) {
 			ti->error = "dm-ssdcache: blocksize too small";
-			sc->block_size = DEFAULT_BLOCKSIZE;
+			sc->block_size = to_sector(DEFAULT_BLOCKSIZE);
 		}
 	} else {
-		sc->block_size = DEFAULT_BLOCKSIZE;
+		sc->block_size = to_sector(DEFAULT_BLOCKSIZE);
 	}
 
 	if (argc >= 4) {
@@ -1284,7 +1283,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	cdev_size = i_size_read(sc->cache_dev->bdev->bd_inode);
 	tdev_size = i_size_read(sc->target_dev->bdev->bd_inode);
 
-	num_cte = cdev_size / sc->block_size / DEFAULT_ASSOCIATIVITY;
+	num_cte = cdev_size / to_bytes(sc->block_size) / DEFAULT_ASSOCIATIVITY;
 
 	/*
 	 * Hash bit calculation might return a lower number
@@ -1296,17 +1295,18 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->hash_shift = 0;
 
 	DPRINTK("block size %lu, hash bits %lu/%lu, num cte %lu",
-		sc->block_size, sc->hash_bits, sc->hash_shift, num_cte);
+		to_bytes(sc->block_size), sc->hash_bits, sc->hash_shift,
+		num_cte);
 
 	INIT_RADIX_TREE(&sc->md_tree, GFP_ATOMIC);
 
 	sc->data_offset = 0;
-	sc->block_mask = to_sector(sc->block_size) - 1;
+	sc->block_mask = sc->block_size - 1;
 	sc->nr_sio = 0;
 	ti->num_flush_requests = 1;
 	ti->num_discard_requests = 1;
 	ti->private = sc;
-	ti->split_io = to_sector(sc->block_size);
+	ti->split_io = sc->block_size;
 	return 0;
 
 bad_io_client:
