@@ -505,6 +505,38 @@ static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
+static void sio_update_clean(struct ssdcache_io *sio)
+{
+	if (sio->error)
+		sio_set_state(sio, CTE_INVALID);
+	else
+		sio_set_state(sio, CTE_CLEAN);
+}
+
+static void sio_invalidate(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *oldcte;
+
+	BUG_ON(!sio || sio->cte_idx < 0);
+
+	spin_lock_irq(&sio->cmd->lock);
+	oldcte = sio->cmd->te[sio->cte_idx];
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], NULL);
+	spin_unlock_irq(&sio->cmd->lock);
+	if (oldcte)
+		call_rcu(&oldcte->rcu, cte_reset);
+}
+
+static void sio_mark_update(struct ssdcache_io *sio)
+{
+	sio_set_state(sio, CTE_UPDATE);
+}
+
+static void sio_mark_prefetch(struct ssdcache_io *sio)
+{
+	sio_set_state(sio, CTE_PREFETCH);
+}
+
 static bool state_is_busy(struct ssdcache_ctx *sc, struct bio * bio,
 			  unsigned long oldstate)
 {
@@ -638,10 +670,7 @@ static void ssdcache_destroy_sio(struct kref *kref)
 	if (!sio_match_sector(sio)) {
 		WPRINTK(sio, "cte overrun, not updating state");
 	} else {
-		if (sio->error)
-			sio_set_state(sio, CTE_INVALID);
-		else
-			sio_set_state(sio, CTE_CLEAN);
+		sio_update_clean(sio);
 	}
 
 	mempool_free(sio, _sio_pool);
@@ -945,9 +974,9 @@ retry:
 				 * data sector invalid
 				 */
 				if (rw == WRITE)
-					sio_set_state(sio, CTE_UPDATE);
+					sio_mark_update(sio);
 				else
-					sio_set_state(sio, CTE_PREFETCH);
+					sio_mark_prefetch(sio);
 			} else {
 				DPRINTK("%lu: %s (cte %lx:%x): matching busy "
 					"cte %08lx", sio->nr, __FUNCTION__,
@@ -1103,7 +1132,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			} else {
 				sio->bio = NULL;
 				sc->cache_busy++;
-				sio_set_state(sio, CTE_INVALID);
+				sio_invalidate(sio);
 				WPRINTK(sio, "cache hit busy state %08lx/%08lx",
 					state, sio->bio_mask);
 				map_context->ptr = NULL;
@@ -1124,7 +1153,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			sc->cache_busy++;
 			WPRINTK(sio, "cache miss busy state %08lx/%08lx",
 				state, sio->bio_mask);
-			sio_set_state(sio, CTE_INVALID);
+			sio_invalidate(sio);
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
