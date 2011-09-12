@@ -73,7 +73,6 @@ struct ssdcache_te {
 	unsigned long state;    /* State bitmap */
 	sector_t sector;	/* Sector number on target device */
 	struct ssdcache_md *md; /* Backlink to metadirectory */
-	struct bio_list writeback;
 	struct rcu_head rcu;
 };
 
@@ -334,7 +333,6 @@ struct ssdcache_te * cte_new(struct ssdcache_ctx *sc, struct ssdcache_md *cmd,
 	newcte->atime = jiffies;
 	newcte->count = 1;
 	newcte->md = cmd;
-	bio_list_init(&newcte->writeback);
 
 	return newcte;
 }
