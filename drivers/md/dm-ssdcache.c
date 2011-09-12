@@ -115,6 +115,7 @@ struct ssdcache_io {
 	struct ssdcache_md *cmd;
 	long cte_idx;
 	struct bio *bio;
+	unsigned long bio_sector;
 	unsigned long bio_mask;
 	unsigned long error;
 };
@@ -145,11 +146,8 @@ enum cte_state {
 	CTE_INVALID,	/* Sector not valid */
 	CTE_CLEAN,	/* Sector valid, Cache and target date identical */
 	/* Transient states */
-	CTE_DIRTY,	/* Sector valid, prepare for I/O */
 	CTE_PREFETCH,	/* Sector valid, Read target data */
-	CTE_RESERVED,	/* Sector valid, Transfer target data into cache */
 	CTE_UPDATE,	/* Sector valid, Write cache data */
-	CTE_WRITEBACK,	/* Sector valid, Transfer cache data to target */
 };
 
 static int do_io(struct ssdcache_io *sio);
@@ -284,11 +282,8 @@ static const struct {
 } cte_state_string[] = {
 	{ CTE_INVALID, "CTE_INVALID"},
 	{ CTE_CLEAN, "CTE_CLEAN" },
-	{ CTE_DIRTY, "CTE_DIRTY" },
 	{ CTE_PREFETCH, "CTE_PREFETCH" },
-	{ CTE_RESERVED, "CTE_RESERVED" },
 	{ CTE_UPDATE, "CTE_UPDATE" },
-	{ CTE_WRITEBACK, "CTE_WRITEBACK" },
 };
 
 const char *cte_state_name(enum cte_state state)
@@ -389,7 +384,6 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		switch (oldstate) {
 		case CTE_CLEAN:
 		case CTE_PREFETCH:
-		case CTE_RESERVED:
 		case CTE_UPDATE:
 			break;
 		default:
@@ -399,19 +393,8 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		break;
 	case CTE_CLEAN:
 		switch (oldstate) {
-		case CTE_DIRTY:
-		case CTE_WRITEBACK:
-		case CTE_RESERVED:
-			break;
-		default:
-			illegal_transition++;
-			break;
-		}
-		break;
-	case CTE_DIRTY:
-		switch (oldstate) {
-		case CTE_CLEAN:
-		case CTE_INVALID:
+		case CTE_UPDATE:
+		case CTE_PREFETCH:
 			break;
 		default:
 			illegal_transition++;
@@ -419,33 +402,10 @@ static inline int cte_check_state_transition(enum cte_state oldstate,
 		}
 		break;
 	case CTE_PREFETCH:
-		switch (oldstate) {
-		case CTE_DIRTY:
-			break;
-		default:
-			illegal_transition++;
-		}
-		break;
-	case CTE_RESERVED:
-		switch (oldstate) {
-		case CTE_PREFETCH:
-			break;
-		default:
-			illegal_transition++;
-		}
-		break;
 	case CTE_UPDATE:
 		switch (oldstate) {
-		case CTE_DIRTY:
-			break;
-		default:
-			illegal_transition++;
-			break;
-		}
-		break;
-	case CTE_WRITEBACK:
-		switch (oldstate) {
-		case CTE_UPDATE:
+		case CTE_INVALID:
+		case CTE_CLEAN:
 			break;
 		default:
 			illegal_transition++;
@@ -561,9 +521,7 @@ static bool state_is_busy(struct ssdcache_ctx *sc, struct bio * bio,
 	for (i = 0; i < num_sectors; i++) {
 		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
 		match += (tmpstate == CTE_PREFETCH);
-		match += ((tmpstate == CTE_UPDATE) ||
-			  (tmpstate == CTE_WRITEBACK));
-		match += (tmpstate == CTE_RESERVED);
+		match += (tmpstate == CTE_UPDATE);
 	}
 	return (match > 0);
 }
@@ -633,6 +591,27 @@ static bool match_sector(struct ssdcache_ctx *sc,
 	return match;
 }
 
+static bool sio_match_sector(struct ssdcache_io *sio)
+{
+	bool match = false;
+	unsigned long oldstate = 0;
+	sector_t sector;
+
+	if (!sio->cmd || sio->cte_idx == (unsigned long)-1)
+		return false;
+
+	rcu_read_lock();
+	if (sio->cmd->te[sio->cte_idx]) {
+		sector = rcu_dereference(sio->cmd->te[sio->cte_idx])->sector;
+		oldstate = rcu_dereference(sio->cmd->te[sio->cte_idx])->state;
+	}
+	rcu_read_unlock();
+	if ((oldstate & sio->bio_mask) != 0)
+		match = (sio->bio_sector == sector);
+
+	return match;
+}
+
 /*
  * Workqueue handling
  */
@@ -659,10 +638,15 @@ static void ssdcache_destroy_sio(struct kref *kref)
 
 	BUG_ON(!list_empty(&sio->list));
 
-	if (sio->error)
-		sio_set_state(sio, CTE_INVALID);
-	else
-		sio_set_state(sio, CTE_CLEAN);
+	if (!sio_match_sector(sio)) {
+		WPRINTK(sio, "cte overrun, not updating state");
+	} else {
+		if (sio->error)
+			sio_set_state(sio, CTE_INVALID);
+		else
+			sio_set_state(sio, CTE_CLEAN);
+	}
+
 	mempool_free(sio, _sio_pool);
 }
 
@@ -758,24 +742,18 @@ static void io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	if (error || sio->error) {
-		WPRINTK(sio, "finished with %lu", error);
-		sio->error = error;
-		sio_set_state(sio, CTE_INVALID);
+	if (!sio_match_sector(sio)) {
+		WPRINTK(sio, "cte overrun, not updating state");
 		goto out;
 	}
 
-	if (sio_is_state(sio, CTE_RESERVED)) {
-		sio_set_state(sio, CTE_CLEAN);
+	if (error || sio->error) {
+		WPRINTK(sio, "finished with %lu", error);
+		sio->error = error;
+	} else {
 		finish_reserved(sio, error);
-	} else if (sio_is_state(sio, CTE_UPDATE)) {
-		sio_set_state(sio, CTE_WRITEBACK);
-	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
-		sio_set_state(sio, CTE_CLEAN);
-	} else if (!sio_is_state(sio, CTE_INVALID)) {
-		WPRINTK(sio, "unhandled state %08lx:%08lx",
-			sio_get_state(sio), sio->bio_mask);
 	}
+
 out:
 	ssdcache_put_sio(sio);
 	queue_work(_ssdcached_wq, &_ssdcached_work);
@@ -840,7 +818,7 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 static int do_io(struct ssdcache_io *sio)
 {
-	if (sio_is_state(sio, CTE_RESERVED)) {
+	if (sio->bio) {
 		/* Start writing to cache device */
 		write_to_cache(sio, sio->bio);
 		return 0;
@@ -897,7 +875,7 @@ static unsigned long rotate(struct ssdcache_ctx *sc, unsigned long value)
 	return result & hash_mask;
 }
 
-static bool cte_match(struct ssdcache_io *sio, sector_t data_sector)
+static bool cte_match(struct ssdcache_io *sio, sector_t data_sector, int rw)
 {
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
@@ -967,9 +945,12 @@ retry:
 					       CTE_INVALID)) {
 				/*
 				 * Cache sector match
-				 * data sector invalid or clean
+				 * data sector invalid
 				 */
-				sio_set_state(sio, CTE_DIRTY);
+				if (rw == WRITE)
+					sio_set_state(sio, CTE_UPDATE);
+				else
+					sio_set_state(sio, CTE_PREFETCH);
 			} else {
 				DPRINTK("%lu: %s (cte %lx:%x): matching busy "
 					"cte %08lx", sio->nr, __FUNCTION__,
@@ -1039,7 +1020,10 @@ found:
 		spin_lock_irq(&sio->cmd->lock);
 		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
-		newcte->state = sio_update_state(sio, 0, CTE_DIRTY);
+		if (rw == WRITE)
+			newcte->state = sio_update_state(sio, 0, CTE_UPDATE);
+		else
+			newcte->state = sio_update_state(sio, 0, CTE_PREFETCH);
 		newcte->sector = data_sector;
 		rcu_assign_pointer(sio->cmd->te[index], newcte);
 		spin_unlock_irq(&sio->cmd->lock);
@@ -1098,8 +1082,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		return DM_MAPIO_REMAPPED;
 	}
 	sio->bio_mask = cte_bio_mask(sc, bio);
-
-	if (cte_match(sio, data_sector)) {
+	sio->bio_sector = data_sector;
+	if (cte_match(sio, data_sector, bio_data_dir(bio))) {
 		/* Cache hit */
 		state = sio_get_state(sio);
 #ifdef SSD_DEBUG
@@ -1109,11 +1093,10 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		map_context->ptr = sio;
 		if (bio_data_dir(bio) == READ) {
-			if (sio_is_state(sio, CTE_DIRTY)) {
+			if (sio_is_state(sio, CTE_PREFETCH)) {
 				sc->cache_misses++;
 				sio->bio = bio;
 				bio_get(bio);
-				sio_set_state(sio, CTE_PREFETCH);
 				bio->bi_bdev = sc->target_dev->bdev;
 			} else if (sio_is_state(sio, CTE_CLEAN)) {
 				sio->bio = NULL;
@@ -1139,8 +1122,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			sio->bio_mask);
 #endif
 		map_context->ptr = sio;
-		if (!sio_is_state(sio, CTE_DIRTY) &&
-		    !sio_is_state(sio, CTE_INVALID)) {
+		if (!sio_is_state(sio, CTE_UPDATE) &&
+		    !sio_is_state(sio, CTE_PREFETCH)) {
 			sc->cache_busy++;
 			WPRINTK(sio, "cache miss busy state %08lx/%08lx",
 				state, sio->bio_mask);
@@ -1152,7 +1135,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			sc->cache_misses++;
 			bio_get(bio);
 			sio->bio = bio;
-			sio_set_state(sio, CTE_PREFETCH);
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
@@ -1165,7 +1147,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	}
 
 	ssdcache_get_sio(sio);
-	sio_set_state(sio, CTE_UPDATE);
 	if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 		bio->bi_bdev = sc->target_dev->bdev;
 		write_to_cache(sio, bio);
@@ -1195,13 +1176,10 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 			bio_put(sio->bio);
 			sio->bio = NULL;
 		}
-		sio_set_state(sio, CTE_INVALID);
 		goto finish;
 	}
 
-	if (sio_is_state(sio, CTE_PREFETCH)) {
-		/* Move to RESERVED */
-		sio_set_state(sio, CTE_RESERVED);
+	if (sio->bio) {
 		/* Setup clone for writing to cache device */
 		clone = bio_clone(sio->bio, GFP_NOWAIT);
 		clone->bi_rw |= WRITE;
@@ -1211,19 +1189,6 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		sio->bio = clone;
 		ssdcache_schedule_sio(sio);
 		return 0;
-	} else if (sio_is_state(sio, CTE_UPDATE)) {
-		/* Direct write completed, indirect write still in flight */
-		sio_set_state(sio, CTE_WRITEBACK);
-	} else if (sio_is_state(sio, CTE_WRITEBACK)) {
-		/* Direct and indirect write completed */
-		sio_set_state(sio, CTE_CLEAN);
-	} else if (sio_is_state(sio, CTE_DIRTY)) {
-		/* Read completed */
-		sio_set_state(sio, CTE_CLEAN);
-	} else if (!sio_is_state(sio, CTE_CLEAN) &&
-		   !sio_is_state(sio, CTE_INVALID)) {
-		WPRINTK(sio, "unhandled state %08lx",
-			sio_get_state(sio));
 	}
 
 finish:
