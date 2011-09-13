@@ -842,6 +842,28 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 	dm_io(&iorq, 1, &target, NULL);
 }
 
+static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
+{
+	sio->sc->cache_misses++;
+	sio->writeback_bio = bio;
+	bio_get(bio);
+	bio->bi_bdev = sio->sc->target_dev->bdev;
+}
+
+static void sio_start_read_hit(struct ssdcache_io *sio, struct bio *bio)
+{
+	sio->sc->cache_hits++;
+	bio->bi_bdev = sio->sc->cache_dev->bdev;
+	bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+}
+
+static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
+{
+	sio->sc->cache_busy++;
+	sio_invalidate(sio);
+	bio->bi_bdev = sio->sc->target_dev->bdev;
+}
+
 static int do_io(struct ssdcache_io *sio)
 {
 	if (sio->writeback_bio) {
@@ -1120,21 +1142,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		map_context->ptr = sio;
 		if (bio_data_dir(bio) == READ) {
 			if (sio_is_state(sio, CTE_PREFETCH)) {
-				sc->cache_misses++;
-				sio->writeback_bio = bio;
-				bio_get(bio);
-				bio->bi_bdev = sc->target_dev->bdev;
+				sio_start_prefetch(sio, bio);
 			} else if (sio_is_state(sio, CTE_CLEAN)) {
-				sc->cache_hits++;
-				bio->bi_bdev = sc->cache_dev->bdev;
-				bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+				sio_start_read_hit(sio, bio);
 			} else {
-				sc->cache_busy++;
-				sio_invalidate(sio);
 				WPRINTK(sio, "cache hit busy state %08lx/%08lx",
 					state, sio->bio_mask);
 				map_context->ptr = NULL;
-				bio->bi_bdev = sc->target_dev->bdev;
+				sio_start_busy(sio, bio);
 			}
 			return DM_MAPIO_REMAPPED;
 		}
@@ -1148,18 +1163,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		map_context->ptr = sio;
 		if (!sio_is_state(sio, CTE_UPDATE) &&
 		    !sio_is_state(sio, CTE_PREFETCH)) {
-			sc->cache_busy++;
 			WPRINTK(sio, "cache miss busy state %08lx/%08lx",
 				state, sio->bio_mask);
-			sio_invalidate(sio);
-			bio->bi_bdev = sc->target_dev->bdev;
+			sio_start_busy(sio, bio);
+			map_context->ptr = NULL;
 			return DM_MAPIO_REMAPPED;
 		}
 		if (bio_data_dir(bio) == READ) {
-			sc->cache_misses++;
-			bio_get(bio);
-			sio->writeback_bio = bio;
-			bio->bi_bdev = sc->target_dev->bdev;
+			sio_start_prefetch(sio, bio);
 			return DM_MAPIO_REMAPPED;
 		}
 	} else {
