@@ -39,7 +39,7 @@
 #define MIN_CMD_NUM 64
 #define DEFAULT_CTE_NUM 4096
 
-#define DEFAULT_BLOCKSIZE	4096
+#define DEFAULT_BLOCKSIZE	8
 #define DEFAULT_ASSOCIATIVITY	64
 
 /* Caching modes */
@@ -71,6 +71,8 @@ struct ssdcache_te {
 	unsigned long atime;	/* Timestamp of the block's last access */
 	unsigned long count;    /* Number of accesses */
 	unsigned long state;    /* State bitmap */
+	DECLARE_BITMAP(clean, DEFAULT_BLOCKSIZE);
+	unsigned long active[DEFAULT_BLOCKSIZE);
 	sector_t sector;	/* Sector number on target device */
 	struct ssdcache_md *md; /* Backlink to metadirectory */
 	struct rcu_head rcu;
@@ -342,31 +344,6 @@ static void cte_reset(struct rcu_head *rp)
 	mempool_free(cte, _cte_pool);
 }
 
-static inline bool cte_is_state(struct ssdcache_ctx *sc, struct ssdcache_te *cte,
-				struct bio *bio, enum cte_state state)
-{
-	unsigned long oldstate;
-	enum cte_state tmpstate;
-	int i, offset, match = 0;
-
-	if (!cte) {
-		if (state == CTE_INVALID)
-			return true;
-		return false;
-	}
-
-	rcu_read_lock();
-	oldstate = rcu_dereference(cte)->state;
-	rcu_read_unlock();
-
-	offset = cte_bio_offset(sc, bio);
-	for (i = 0; i < to_sector(bio->bi_size); i++) {
-		tmpstate = (oldstate >> ((offset + i) * 2)) & 0x3;
-		match += (tmpstate == state);
-	}
-	return (match == to_sector(bio->bi_size));
-}
-
 static inline int cte_check_state_transition(enum cte_state oldstate,
 					     enum cte_state newstate)
 {
@@ -469,6 +446,21 @@ static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 	memset(&newstate, tmpstate, sizeof(unsigned long));
 
 	return ((oldstate & sio->bio_mask) == (newstate & sio->bio_mask));
+}
+
+static bool sio_is_clean(struct ssdcache_io *sio)
+{
+	return sio_is_state(sio, CTE_CLEAN);
+}
+
+static bool sio_is_update(struct ssdcache_io *sio)
+{
+	return sio_is_state(sio, CTE_UPDATE);
+}
+
+static bool sio_is_prefetch(struct ssdcache_io *sio)
+{
+	return sio_is_state(sio, CTE_PREFETCH);
 }
 
 static void sio_set_state(struct ssdcache_io *sio, enum cte_state state)
@@ -1052,7 +1044,7 @@ static void process_sio(struct work_struct *ignored)
 				if (!sio->cmd)
 					cte_match(sio, sio->bio_sector, WRITE);
 				if (sio->cmd && sio->cte_idx != -1) {
-					if (sio_is_state(sio, CTE_CLEAN)) {
+					if (sio_is_clean(sio)) {
 						/*
 						 * race condition; someone else
 						 * set the cte to clean
@@ -1060,7 +1052,7 @@ static void process_sio(struct work_struct *ignored)
 						WPRINTK(sio, "cte overrun");
 						sio_set_state(sio, CTE_UPDATE);
 					}
-					if (!sio_is_state(sio, CTE_UPDATE)) {
+					if (!sio_is_update(sio)) {
 						/*
 						 * Cache lookup returned
 						 * busy cte
@@ -1078,7 +1070,7 @@ static void process_sio(struct work_struct *ignored)
 					sio->sc->cache_failures++;
 				}
 			} else if (sio->cte_idx != -1) {
-				if (!sio_is_state(sio, CTE_UPDATE)) {
+				if (!sio_is_update(sio)) {
 					WPRINTK(sio, "wb cte busy state %08lx",
 						sio_get_state(sio));
 					sio->sc->cache_busy++;
@@ -1098,7 +1090,7 @@ static void process_sio(struct work_struct *ignored)
 				WPRINTK(sio, "writeback cte overrun");
 				sio->error = ENOENT;
 				sio->sc->cache_failures++;
-			} else if (!sio_is_state(sio, CTE_PREFETCH)) {
+			} else if (!sio_is_prefetch(sio)) {
 				WPRINTK(sio, "prefetch cte busy state %08lx",
 					sio_get_state(sio));
 				sio->error = ENODATA;
@@ -1178,9 +1170,9 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		map_context->ptr = sio;
 		if (bio_data_dir(bio) == READ) {
-			if (sio_is_state(sio, CTE_PREFETCH)) {
+			if (sio_is_prefetch(sio)) {
 				sio_start_prefetch(sio, bio);
-			} else if (sio_is_state(sio, CTE_CLEAN)) {
+			} else if (sio_is_clean(sio)) {
 				sio_start_read_hit(sio, bio);
 			} else {
 				WPRINTK(sio, "cache hit busy state %08lx/%08lx",
@@ -1198,8 +1190,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			sio->bio_mask);
 #endif
 		map_context->ptr = sio;
-		if (!sio_is_state(sio, CTE_UPDATE) &&
-		    !sio_is_state(sio, CTE_PREFETCH)) {
+		if (!sio_is_update(sio) &&
+		    !sio_is_prefetch(sio)) {
 			WPRINTK(sio, "cache miss busy state %08lx/%08lx",
 				state, sio->bio_mask);
 			sio_start_busy(sio, bio);
@@ -1307,14 +1299,14 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (argc >= 3) {
 		if (sscanf(argv[2], "%lu", &sc->block_size) != 1) {
 			ti->error = "dm-ssdcache: Invalid blocksize";
-			sc->block_size = to_sector(DEFAULT_BLOCKSIZE);
+			sc->block_size = DEFAULT_BLOCKSIZE;
 		}
 		if (sc->block_size < 1) {
 			ti->error = "dm-ssdcache: blocksize too small";
-			sc->block_size = to_sector(DEFAULT_BLOCKSIZE);
+			sc->block_size = DEFAULT_BLOCKSIZE;
 		}
 	} else {
-		sc->block_size = to_sector(DEFAULT_BLOCKSIZE);
+		sc->block_size = DEFAULT_BLOCKSIZE;
 	}
 
 	if (argc >= 4) {
