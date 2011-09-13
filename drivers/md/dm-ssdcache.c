@@ -947,7 +947,7 @@ retry:
 				else
 					sio_mark_prefetch(sio);
 			} else {
-				DPRINTK("%lu: %s (cte %lx:%x): matching busy "
+				DPRINTK("%lu: %s (cte %lx:%x): matching "
 					"cte %08lx", sio->nr, __FUNCTION__,
 					sio->cmd->hash, i, cte_state);
 			}
@@ -1057,24 +1057,43 @@ static void process_sio(struct work_struct *ignored)
 						 * Cache lookup returned
 						 * busy cte
 						 */
+						WPRINTK(sio, "wt cte busy state %08lx",
+							sio_get_state(sio));
+						sio->sc->cache_busy++;
 						sio_invalidate(sio);
 					} else {
+						WPRINTK(sio, "start cache write");
 						write_to_cache(sio, sio->bio);
 					}
+				} else {
+					WPRINTK(sio, "invalid writethrough cte");
+					sio->error = EINVAL;
+					sio->sc->cache_failures++;
 				}
 			} else if (sio->cte_idx != -1) {
-				if (!sio_is_state(sio, CTE_UPDATE))
+				if (!sio_is_state(sio, CTE_UPDATE)) {
+					WPRINTK(sio, "wb cte busy state %08lx",
+						sio_get_state(sio));
+					sio->sc->cache_busy++;
 					sio_invalidate(sio);
-				else
+				} else {
+					WPRINTK(sio, "start target write");
 					write_to_target(sio, sio->bio);
+				}
+			} else {
+				WPRINTK(sio, "invalid writeback cte");
+				sio->error = EINVAL;
+				sio->sc->cache_failures++;
 			}
 			bio_put(sio->bio);
 			sio->bio = NULL;
 		} else if (sio->writeback_bio) {
 			/* Start writing to cache device */
 			write_to_cache(sio, sio->writeback_bio);
+		} else {
+			WPRINTK(sio, "unhandled state %08lx",
+				sio_get_state(sio));
 		}
-		WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
 		ssdcache_put_sio(sio);
 	}
 	spin_lock_irqsave(&_work_lock, flags);
@@ -1131,6 +1150,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		bio_get(bio);
 		sio->bio = bio;
 		ssdcache_schedule_sio(sio);
+		goto done;
 	}
 	if (cte_match(sio, data_sector, READ)) {
 		/* Cache hit */
@@ -1181,7 +1201,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		ssdcache_put_sio(sio);
 		return DM_MAPIO_REMAPPED;
 	}
-
+done:
 	if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 		bio->bi_bdev = sc->target_dev->bdev;
 	} else {
