@@ -113,6 +113,7 @@ struct ssdcache_io {
 	struct ssdcache_ctx *sc;
 	struct ssdcache_md *cmd;
 	long cte_idx;
+	struct bio *bio;
 	struct bio *writeback_bio;
 	unsigned long bio_sector;
 	unsigned long bio_mask;
@@ -684,12 +685,13 @@ static int ssdcache_put_sio(struct ssdcache_io *sio)
 	return kref_put(&sio->kref, ssdcache_destroy_sio);
 }
 
-static inline void push_sio(struct list_head *q, struct ssdcache_io *w)
+static inline void push_sio(struct list_head *q, struct ssdcache_io *sio)
 {
 	unsigned long flags;
 
+	ssdcache_get_sio(sio);
 	spin_lock_irqsave(&_work_lock, flags);
-	list_add_tail(&w->list, q);
+	list_add_tail(&sio->list, q);
 	spin_unlock_irqrestore(&_work_lock, flags);
 }
 
@@ -818,29 +820,6 @@ static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
 	sio->sc->cache_busy++;
 	sio_invalidate(sio);
 	bio->bi_bdev = sio->sc->target_dev->bdev;
-}
-
-static void process_sio(struct work_struct *ignored)
-{
-	LIST_HEAD(tmp);
-	LIST_HEAD(defer);
-	unsigned long flags;
-	struct ssdcache_io *sio, *next;
-
-	spin_lock_irqsave(&_work_lock, flags);
-	list_splice_init(&_io_work, &tmp);
-	spin_unlock_irqrestore(&_work_lock, flags);
-	list_for_each_entry_safe(sio, next, &tmp, list) {
-		list_del_init(&sio->list);
-		if (sio->writeback_bio) {
-			/* Start writing to cache device */
-			write_to_cache(sio, sio->writeback_bio);
-		}
-		WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
-	}
-	spin_lock_irqsave(&_work_lock, flags);
-	list_splice(&tmp, &_io_work);
-	spin_unlock_irqrestore(&_work_lock, flags);
 }
 
 /*
@@ -1055,6 +1034,54 @@ found:
 	return false;
 }
 
+static void process_sio(struct work_struct *ignored)
+{
+	LIST_HEAD(tmp);
+	LIST_HEAD(defer);
+	unsigned long flags;
+	struct ssdcache_io *sio, *next;
+
+	spin_lock_irqsave(&_work_lock, flags);
+	list_splice_init(&_io_work, &tmp);
+	spin_unlock_irqrestore(&_work_lock, flags);
+	list_for_each_entry_safe(sio, next, &tmp, list) {
+		list_del_init(&sio->list);
+		if (sio->bio) {
+			/* secondary write */
+			if (sio->sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+				if (!sio->cmd)
+					cte_match(sio, sio->bio_sector, WRITE);
+				if (sio->cmd && sio->cte_idx != -1) {
+					if (!sio_is_state(sio, CTE_UPDATE)) {
+						/*
+						 * Cache lookup returned
+						 * busy cte
+						 */
+						sio_invalidate(sio);
+					} else {
+						write_to_cache(sio, sio->bio);
+					}
+				}
+			} else if (sio->cte_idx != -1) {
+				if (!sio_is_state(sio, CTE_UPDATE))
+					sio_invalidate(sio);
+				else
+					write_to_target(sio, sio->bio);
+			}
+			bio_put(sio->bio);
+			sio->bio = NULL;
+		} else if (sio->writeback_bio) {
+			/* Start writing to cache device */
+			write_to_cache(sio, sio->writeback_bio);
+		}
+		WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
+		ssdcache_put_sio(sio);
+	}
+	spin_lock_irqsave(&_work_lock, flags);
+	list_splice(&tmp, &_io_work);
+	spin_unlock_irqrestore(&_work_lock, flags);
+}
+
 static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
 {
@@ -1099,7 +1126,13 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	}
 	sio->bio_mask = cte_bio_mask(sc, bio);
 	sio->bio_sector = data_sector;
-	if (cte_match(sio, data_sector, bio_data_dir(bio))) {
+	if (bio_data_dir(bio) == WRITE &&
+	    sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+		bio_get(bio);
+		sio->bio = bio;
+		ssdcache_schedule_sio(sio);
+	}
+	if (cte_match(sio, data_sector, READ)) {
 		/* Cache hit */
 		state = sio_get_state(sio);
 #ifdef SSD_DEBUG
@@ -1149,14 +1182,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		return DM_MAPIO_REMAPPED;
 	}
 
-	ssdcache_get_sio(sio);
 	if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 		bio->bi_bdev = sc->target_dev->bdev;
-		write_to_cache(sio, bio);
 	} else {
+		bio_get(bio);
+		sio->bio = bio;
+		ssdcache_schedule_sio(sio);
 		bio->bi_bdev = sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-		write_to_target(sio, bio);
 	}
 	return DM_MAPIO_REMAPPED;
 }
@@ -1191,7 +1224,6 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		bio_put(sio->writeback_bio);
 		sio->writeback_bio = clone;
 		ssdcache_schedule_sio(sio);
-		return 0;
 	}
 
 finish:
