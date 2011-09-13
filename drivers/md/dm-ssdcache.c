@@ -312,7 +312,7 @@ static unsigned long cte_bio_mask(struct ssdcache_ctx *sc, struct bio *bio)
 	for (i = 0; i < sc->block_size; i++) {
 		if (i >= cte_bio_offset(sc, bio) &&
 		    i < cte_bio_offset(sc, bio) + to_sector(bio->bi_size)) {
-			mask |= (0xFUL << (i * 4));
+			mask |= (0x3UL << (i * 2));
 		}
 	}
 
@@ -361,7 +361,7 @@ static inline bool cte_is_state(struct ssdcache_ctx *sc, struct ssdcache_te *cte
 
 	offset = cte_bio_offset(sc, bio);
 	for (i = 0; i < to_sector(bio->bi_size); i++) {
-		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
+		tmpstate = (oldstate >> ((offset + i) * 2)) & 0x3;
 		match += (tmpstate == state);
 	}
 	return (match == to_sector(bio->bi_size));
@@ -420,10 +420,10 @@ static unsigned long sio_update_state(struct ssdcache_io *sio,
 	enum cte_state tmpstate;
 
 	for (i = 0; i < sio->sc->block_size; i++) {
-		state_shift = (i * 4);
-		tmpmask = (sio->bio_mask >> state_shift) & 0xF;
+		state_shift = (i * 2);
+		tmpmask = (sio->bio_mask >> state_shift) & 0x3;
 		if (tmpmask == 0xF) {
-			tmpstate = (oldstate >> state_shift) & 0xF;
+			tmpstate = (oldstate >> state_shift) & 0x3;
 			if (cte_check_state_transition(tmpstate, state)) {
 				illegal++;
 			}
@@ -465,7 +465,7 @@ static inline bool sio_is_state(struct ssdcache_io *sio, enum cte_state state)
 	BUG_ON(!sio);
 
 	oldstate = sio_get_state(sio);
-	tmpstate = state | (state << 4);
+	tmpstate = state | (state << 2) | (state << 4) | (state << 6);
 	memset(&newstate, tmpstate, sizeof(unsigned long));
 
 	return ((oldstate & sio->bio_mask) == (newstate & sio->bio_mask));
@@ -549,7 +549,7 @@ static bool state_is_busy(struct ssdcache_ctx *sc, struct bio * bio,
 	offset= cte_bio_offset(sc, bio);
 
 	for (i = 0; i < num_sectors; i++) {
-		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
+		tmpstate = (oldstate >> ((offset + i) * 2)) & 0x3;
 		match += (tmpstate == CTE_PREFETCH);
 		match += (tmpstate == CTE_UPDATE);
 	}
@@ -560,7 +560,7 @@ static bool state_match(struct ssdcache_ctx *sc, unsigned long oldstate,
 		     enum cte_state state)
 {
 	unsigned long tmpstate, cte_mask = cte_state_mask(sc);
-	unsigned char numstate = state | (state << 4);
+	unsigned char numstate = state | (state << 2) | (state << 4) | (state << 6);
 
 	memset(&tmpstate, numstate, sizeof(unsigned long));
 
@@ -571,7 +571,7 @@ static bool masked_state_match(unsigned long oldstate, unsigned long mask,
 			       enum cte_state state)
 {
 	unsigned long tmpstate;
-	unsigned char numstate = state | (state << 4);
+	unsigned char numstate = state | (state << 2) | (state << 4) | (state << 6);
 
 	memset(&tmpstate, numstate, sizeof(unsigned long));
 
@@ -589,7 +589,7 @@ static bool state_is_inactive(struct ssdcache_ctx *sc, struct bio * bio,
 	offset= cte_bio_offset(sc, bio);
 
 	for (i = 0; i < num_sectors; i++) {
-		tmpstate = (oldstate >> ((offset + i) * 4)) & 0xF;
+		tmpstate = (oldstate >> ((offset + i) * 2)) & 0x3;
 		match += ((tmpstate == CTE_CLEAN) ||
 			  (tmpstate == CTE_INVALID));
 	}
