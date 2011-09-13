@@ -113,7 +113,7 @@ struct ssdcache_io {
 	struct ssdcache_ctx *sc;
 	struct ssdcache_md *cmd;
 	long cte_idx;
-	struct bio *bio;
+	struct bio *writeback_bio;
 	unsigned long bio_sector;
 	unsigned long bio_mask;
 	unsigned long error;
@@ -755,12 +755,12 @@ static void finish_reserved(struct ssdcache_io *sio, unsigned long error)
 	int i;
 	struct bio_vec *bvec;
 
-	if (sio->bio) {
+	if (sio->writeback_bio) {
 		/* Release bio */
-		bio_for_each_segment(bvec, sio->bio, i)
+		bio_for_each_segment(bvec, sio->writeback_bio, i)
 			put_page(bvec->bv_page);
-		bio_put(sio->bio);
-		sio->bio = NULL;
+		bio_put(sio->writeback_bio);
+		sio->writeback_bio = NULL;
 	}
 }
 
@@ -844,9 +844,9 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 static int do_io(struct ssdcache_io *sio)
 {
-	if (sio->bio) {
+	if (sio->writeback_bio) {
 		/* Start writing to cache device */
-		write_to_cache(sio, sio->bio);
+		write_to_cache(sio, sio->writeback_bio);
 		return 0;
 	}
 	WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
@@ -1121,16 +1121,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		if (bio_data_dir(bio) == READ) {
 			if (sio_is_state(sio, CTE_PREFETCH)) {
 				sc->cache_misses++;
-				sio->bio = bio;
+				sio->writeback_bio = bio;
 				bio_get(bio);
 				bio->bi_bdev = sc->target_dev->bdev;
 			} else if (sio_is_state(sio, CTE_CLEAN)) {
-				sio->bio = NULL;
 				sc->cache_hits++;
 				bio->bi_bdev = sc->cache_dev->bdev;
 				bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
 			} else {
-				sio->bio = NULL;
 				sc->cache_busy++;
 				sio_invalidate(sio);
 				WPRINTK(sio, "cache hit busy state %08lx/%08lx",
@@ -1160,7 +1158,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		if (bio_data_dir(bio) == READ) {
 			sc->cache_misses++;
 			bio_get(bio);
-			sio->bio = bio;
+			sio->writeback_bio = bio;
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
@@ -1198,21 +1196,21 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	if (error || sio->error) {
 		WPRINTK(sio, "finished with %u", error);
 		sio->error = error;
-		if (sio->bio) {
-			bio_put(sio->bio);
-			sio->bio = NULL;
+		if (sio->writeback_bio) {
+			bio_put(sio->writeback_bio);
+			sio->writeback_bio = NULL;
 		}
 		goto finish;
 	}
 
-	if (sio->bio) {
+	if (sio->writeback_bio) {
 		/* Setup clone for writing to cache device */
-		clone = bio_clone(sio->bio, GFP_NOWAIT);
+		clone = bio_clone(sio->writeback_bio, GFP_NOWAIT);
 		clone->bi_rw |= WRITE;
-		bio_for_each_segment(bvec, sio->bio, i)
+		bio_for_each_segment(bvec, sio->writeback_bio, i)
 			get_page(bvec->bv_page);
-		bio_put(sio->bio);
-		sio->bio = clone;
+		bio_put(sio->writeback_bio);
+		sio->writeback_bio = clone;
 		ssdcache_schedule_sio(sio);
 		return 0;
 	}
