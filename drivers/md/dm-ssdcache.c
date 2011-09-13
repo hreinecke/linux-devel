@@ -149,8 +149,6 @@ enum cte_state {
 	CTE_UPDATE,	/* Sector valid, Write cache data */
 };
 
-static int do_io(struct ssdcache_io *sio);
-
 /*
  * Slab pools
  */
@@ -701,48 +699,6 @@ static void ssdcache_schedule_sio(struct ssdcache_io *sio)
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
-static int process_sio(struct list_head *q,
-			 int (*fn) (struct ssdcache_io *))
-{
-	LIST_HEAD(tmp);
-	LIST_HEAD(defer);
-	unsigned long flags;
-	struct ssdcache_io *sio, *next;
-	int r, dequeued = 0;
-
-	spin_lock_irqsave(&_work_lock, flags);
-	list_splice_init(q, &tmp);
-	spin_unlock_irqrestore(&_work_lock, flags);
-	list_for_each_entry_safe(sio, next, &tmp, list) {
-		list_del_init(&sio->list);
-		r = fn(sio);
-		if (r < 0) {
-			DMERR("process_sio: Job processing error");
-		} else if (r > 0) {
-			list_add_tail(&sio->list, &defer);
-		} else {
-			dequeued++;
-		}
-	}
-	spin_lock_irqsave(&_work_lock, flags);
-	list_splice(&defer, q);
-	list_splice(&tmp, q);
-	spin_unlock_irqrestore(&_work_lock, flags);
-	return dequeued;
-}
-
-static void do_sio(struct work_struct *ignored)
-{
-	int items = 1, empty = 0;
-
-	while (items > 0) {
-		empty = 0;
-		items = process_sio(&_io_work, do_io);
-		if (list_empty(&_io_work))
-			empty++;
-	}
-}
-
 /*
  * finish_reserved
  *
@@ -864,15 +820,27 @@ static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
 
-static int do_io(struct ssdcache_io *sio)
+static void process_sio(struct work_struct *ignored)
 {
-	if (sio->writeback_bio) {
-		/* Start writing to cache device */
-		write_to_cache(sio, sio->writeback_bio);
-		return 0;
+	LIST_HEAD(tmp);
+	LIST_HEAD(defer);
+	unsigned long flags;
+	struct ssdcache_io *sio, *next;
+
+	spin_lock_irqsave(&_work_lock, flags);
+	list_splice_init(&_io_work, &tmp);
+	spin_unlock_irqrestore(&_work_lock, flags);
+	list_for_each_entry_safe(sio, next, &tmp, list) {
+		list_del_init(&sio->list);
+		if (sio->writeback_bio) {
+			/* Start writing to cache device */
+			write_to_cache(sio, sio->writeback_bio);
+		}
+		WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
 	}
-	WPRINTK(sio, "unhandled state %08lx", sio_get_state(sio));
-	return 0;
+	spin_lock_irqsave(&_work_lock, flags);
+	list_splice(&tmp, &_io_work);
+	spin_unlock_irqrestore(&_work_lock, flags);
 }
 
 /*
@@ -1477,7 +1445,7 @@ int __init dm_ssdcache_init(void)
 		pool_exit();
 		return -ENOMEM;
 	}
-	INIT_WORK(&_ssdcached_work, do_sio);
+	INIT_WORK(&_ssdcached_work, process_sio);
 
 	r = dm_register_target(&ssdcache_target);
 	if (r < 0) {
