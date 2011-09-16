@@ -1114,6 +1114,8 @@ static void process_sio(struct work_struct *ignored)
 				sio_start_cache_write(sio);
 				write_to_cache(sio, sio->writeback_bio);
 			}
+		} else {
+			WPRINTK(sio, "invalid workqueue state");
 		}
 		ssdcache_put_sio(sio);
 	}
@@ -1161,6 +1163,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	}
 	sio->bio_sector = cte_bio_align(sc, bio);
 	sio_bio_mask(sio, bio);
+	map_context->ptr = sio;
 	if (bio_data_dir(bio) == WRITE) {
 		struct bio_vec *bvec;
 		int i;
@@ -1176,7 +1179,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			return DM_MAPIO_REMAPPED;
 		}
 	}
-	map_context->ptr = sio;
 	switch (cte_match(sio, bio_data_dir(bio))) {
 	case CTE_READ_CLEAN:
 		/* Cache hit, cte clean */
@@ -1262,7 +1264,7 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	struct ssdcache_io *sio = map_context->ptr;
 
 	if (!sio)
-		return 0;
+		return error;
 
 	if (error || sio->error) {
 		WPRINTK(sio, "finished with %u", error);
@@ -1294,7 +1296,7 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 
 	ssdcache_put_sio(sio);
 
-	return 0;
+	return error;
 }
 
 
