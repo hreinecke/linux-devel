@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-#define SSD_DEBUG
+// #define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -554,8 +554,7 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
-	if (oldcte)
-		call_rcu(&oldcte->rcu, cte_reset);
+	call_rcu(&oldcte->rcu, cte_reset);
 }
 
 static void sio_start_target_write(struct ssdcache_io *sio)
@@ -582,8 +581,7 @@ static void sio_start_target_write(struct ssdcache_io *sio)
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
-	if (oldcte)
-		call_rcu(&oldcte->rcu, cte_reset);
+	call_rcu(&oldcte->rcu, cte_reset);
 }
 
 /*
@@ -613,6 +611,15 @@ static void ssdcache_destroy_sio(struct kref *kref)
 
 	BUG_ON(!list_empty(&sio->list));
 
+	if (sio->bio) {
+		struct bio_vec *bvec;
+		int i;
+
+		bio_for_each_segment(bvec, sio->bio, i)
+			put_page(bvec->bv_page);
+		bio_put(sio->bio);
+		sio->bio = NULL;
+	}
 	if (sio_match_sector(sio) &&
 	    !sio_cache_is_busy(sio) &&
 	    !sio_target_is_busy(sio))
@@ -1078,8 +1085,6 @@ static void process_sio(struct work_struct *ignored)
 				sio_start_target_write(sio);
 				write_to_target(sio, sio->bio);
 			}
-			bio_put(sio->bio);
-			sio->bio = NULL;
 		} else if (sio->writeback_bio) {
 			if (!sio_start_writeback(sio)) {
 				WPRINTK(sio, "cancel writeback");
@@ -1139,9 +1144,13 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio->bio_sector = cte_bio_align(sc, bio);
 	sio_bio_mask(sio, bio);
 	if (bio_data_dir(bio) == WRITE) {
+		struct bio_vec *bvec;
+		int i;
+
 		/* Kick off secondary writes */
-		bio_get(bio);
-		sio->bio = bio;
+		sio->bio = bio_clone(bio, GFP_NOWAIT);
+		bio_for_each_segment(bvec, sio->bio, i)
+			get_page(bvec->bv_page);
 		ssdcache_schedule_sio(sio);
 		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
