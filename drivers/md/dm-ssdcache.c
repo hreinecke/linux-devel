@@ -800,7 +800,13 @@ static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
 
-static bool sio_start_writeback(struct ssdcache_io *sio)
+static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
+{
+	bio->bi_bdev = sio->sc->cache_dev->bdev;
+	bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+}
+
+static bool sio_check_writeback(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *cte;
 
@@ -839,7 +845,6 @@ static bool sio_start_writeback(struct ssdcache_io *sio)
 		return false;
 	}
 
-	sio_start_cache_write(sio);
 	return true;
 }
 /*
@@ -1098,7 +1103,7 @@ static void process_sio(struct work_struct *ignored)
 				write_to_target(sio, sio->bio);
 			}
 		} else if (sio->writeback_bio) {
-			if (!sio_start_writeback(sio)) {
+			if (!sio_check_writeback(sio)) {
 				WPRINTK(sio, "cancel writeback");
 				unmap_writeback_bio(sio);
 				sio->error = ENOENT;
@@ -1106,6 +1111,7 @@ static void process_sio(struct work_struct *ignored)
 			} else {
 				/* Start writing to cache device */
 				ssdcache_get_sio(sio);
+				sio_start_cache_write(sio);
 				write_to_cache(sio, sio->writeback_bio);
 			}
 		}
@@ -1228,8 +1234,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 #endif
-		bio->bi_bdev = sc->cache_dev->bdev;
-		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+		sio_start_write_miss(sio, bio);
 		break;
 	case CTE_WRITE_CLEAN:
 #ifdef SSD_DEBUG
@@ -1237,8 +1242,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 #endif
-		bio->bi_bdev = sc->cache_dev->bdev;
-		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+		sio_start_write_miss(sio, bio);
 		break;
 	case CTE_WRITE_MISS:
 #ifdef SSD_DEBUG
@@ -1246,8 +1250,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 #endif
-		bio->bi_bdev = sc->cache_dev->bdev;
-		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+		sio_start_write_miss(sio, bio);
 		break;
 	}
 	return DM_MAPIO_REMAPPED;
