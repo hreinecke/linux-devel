@@ -322,7 +322,7 @@ void sio_bio_mask(struct ssdcache_io *sio, struct bio *bio)
 	unsigned long offset = cte_bio_offset(sio->sc, bio);
 	int i;
 
-	for (i = 0; i < to_sector(bio->bi_size); i++) {
+	for (i = 0; i < bio_sectors(bio); i++) {
 		set_bit(offset + i, sio->bio_mask);
 	}
 }
@@ -379,8 +379,9 @@ static bool sio_cache_is_busy(struct ssdcache_io *sio)
 	struct ssdcache_te *cte;
 	bool match = false;
 
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return false;
+	BUG_ON(!sio);
+	BUG_ON(!sio->cmd);
+	BUG_ON(sio->cte_idx == -1);
 
 	rcu_read_lock();
 	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
@@ -431,12 +432,14 @@ static void sio_cleanup_cte(struct ssdcache_io *sio)
 	struct ssdcache_te *newcte, *oldcte;
 	bool is_invalid = false;
 
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return;
+	BUG_ON(!sio);
+	BUG_ON(!sio->cmd);
+	BUG_ON(sio->cte_idx == -1);
 
 	rcu_read_lock();
 	oldcte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
-	if (bitmap_empty(oldcte->clean, DEFAULT_BLOCKSIZE) &&
+	if (oldcte &&
+	    bitmap_empty(oldcte->clean, DEFAULT_BLOCKSIZE) &&
 	    bitmap_empty(oldcte->target_busy, DEFAULT_BLOCKSIZE) &&
 	    bitmap_empty(oldcte->cache_busy, DEFAULT_BLOCKSIZE))
 		is_invalid = true;
@@ -470,8 +473,10 @@ static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
 {
 	struct ssdcache_te *newcte, *oldcte;
 
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return;
+	BUG_ON(!sio);
+
+	BUG_ON(!sio->cmd);
+	BUG_ON(sio->cte_idx == -1);
 
 	/* Check if we should drop the old cte */
 	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
@@ -487,20 +492,21 @@ static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
 	newcte->count++;
 	/* Reset busy bitmaps */
 	if (is_cache)
-		bitmap_andnot(newcte->cache_busy, oldcte->cache_busy,
+		bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
 			      sio->bio_mask, DEFAULT_BLOCKSIZE);
 	else
-		bitmap_andnot(newcte->target_busy, oldcte->target_busy,
+		bitmap_andnot(newcte->target_busy, newcte->target_busy,
 			      sio->bio_mask, DEFAULT_BLOCKSIZE);
 
 	/* Upon error always reset the clean bitmap */
 	if (sio->error)
-		bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
+		bitmap_andnot(newcte->clean, newcte->clean, sio->bio_mask,
 			      DEFAULT_BLOCKSIZE);
 	/* And update the clean bitmap if it was a cache write */
-	else if (is_cache)
-			bitmap_or(newcte->clean, oldcte->clean, sio->bio_mask,
-				  DEFAULT_BLOCKSIZE);
+	else if (is_cache) {
+		bitmap_or(newcte->clean, newcte->clean, sio->bio_mask,
+			  DEFAULT_BLOCKSIZE);
+	}
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
@@ -536,13 +542,13 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 
 	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
-	if (oldcte)
-		*newcte = *oldcte;
+	BUG_ON(!oldcte);
+	*newcte = *oldcte;
 
 	newcte->count++;
 	bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
-		   DEFAULT_BLOCKSIZE);
-	bitmap_and(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
+		      DEFAULT_BLOCKSIZE);
+	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
 	newcte->atime = jiffies;
 
@@ -566,12 +572,12 @@ static void sio_start_target_write(struct ssdcache_io *sio)
 
 	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
-	if (oldcte)
-		*newcte = *oldcte;
+	BUG_ON(!oldcte);
+	*newcte = *oldcte;
 
 	newcte->count++;
-	bitmap_and(newcte->target_busy, oldcte->target_busy, sio->bio_mask,
-		   DEFAULT_BLOCKSIZE);
+	bitmap_or(newcte->target_busy, oldcte->target_busy, sio->bio_mask,
+		  DEFAULT_BLOCKSIZE);
 	newcte->atime = jiffies;
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
@@ -729,7 +735,7 @@ static void write_to_cache(struct ssdcache_io *sio, struct bio *bio)
 
 	cache.bdev = sio->sc->cache_dev->bdev;
 	cache.sector = to_cache_sector(sio, bio->bi_sector);
-	cache.count = to_sector(bio->bi_size);
+	cache.count = to_sector(bio_cur_bytes(bio));
 
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
@@ -748,7 +754,7 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 	target.bdev = sio->sc->target_dev->bdev;
 	target.sector = bio->bi_sector;
-	target.count = to_sector(bio->bi_size);
+	target.count = to_sector(bio_cur_bytes(bio));
 
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
@@ -785,8 +791,9 @@ static bool sio_start_writeback(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *cte;
 
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return false;
+	BUG_ON(!sio);
+	BUG_ON(!sio->cmd);
+	BUG_ON(sio->cte_idx == -1);
 
 	rcu_read_lock();
 	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
@@ -927,7 +934,8 @@ retry:
 					return CTE_WRITE_CLEAN;
 				}
 				return CTE_READ_CLEAN;
-			} else if (cte_cache_is_busy(cte, sio->bio_mask)) {
+			} else if (cte_target_is_busy(cte, sio->bio_mask) ||
+				   cte_cache_is_busy(cte, sio->bio_mask)) {
 				/* Busy cte */
 				if (rw == WRITE) {
 					return CTE_WRITE_BUSY;
@@ -946,7 +954,9 @@ retry:
 		if (invalid != -1)
 			break;
 		/* Can only eject CLEAN entries */
-		if (!cte_is_clean(cte, sio->bio_mask)) {
+		if (!cte_is_clean(cte, sio->bio_mask) ||
+		    cte_target_is_busy(cte, sio->bio_mask) ||
+		    cte_cache_is_busy(cte, sio->bio_mask)) {
 #ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:%x): skip not-clean cte",
 				sio->nr, __FUNCTION__, sio->cmd->hash, i);
@@ -1005,7 +1015,7 @@ found:
 		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
 		if (rw == WRITE) {
-			bitmap_and(newcte->cache_busy, oldcte->cache_busy,
+			bitmap_or(newcte->cache_busy, newcte->cache_busy,
 				   sio->bio_mask, DEFAULT_BLOCKSIZE);
 			retval = CTE_WRITE_MISS;
 		} else {
@@ -1077,6 +1087,7 @@ static void process_sio(struct work_struct *ignored)
 				sio->sc->cache_overruns++;
 			} else {
 				/* Start writing to cache device */
+				WPRINTK(sio, "start writeback");
 				ssdcache_get_sio(sio);
 				write_to_cache(sio, sio->writeback_bio);
 			}
@@ -1100,15 +1111,16 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		return DM_MAPIO_REMAPPED;
 	}
 
-	if (bio->bi_size > to_bytes(sc->block_size)) {
-		DPRINTK("bio size %u larger than block size", bio->bi_size);
+	if (bio_cur_bytes(bio) > to_bytes(sc->block_size)) {
+		DPRINTK("bio size %u larger than block size",
+			bio_cur_bytes(bio));
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
 		return DM_MAPIO_REMAPPED;
 	}
 
-	if (bio->bi_size == 0) {
+	if (bio_cur_bytes(bio) == 0) {
 		DPRINTK("zero-sized bio (flags %lx)", bio->bi_flags);
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
@@ -1141,18 +1153,16 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	case CTE_READ_CLEAN:
 		/* Cache hit, cte clean */
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "read hit clean %llx %lx",
+		WPRINTK(sio, "read hit clean %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
+			bio_cur_bytes(bio));
 #endif
 		sio_start_read_hit(sio, bio);
 		break;
 	case CTE_READ_BUSY:
-#ifdef SSD_DEBUG
-		WPRINTK(sio, "read hit busy %llx %lx",
+		WPRINTK(sio, "read hit busy %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
-#endif
+			bio_cur_bytes(bio));
 		/* Do not start prefetching here, sector is already busy */
 		sc->cache_busy++;
 		bio->bi_bdev = sc->target_dev->bdev;
@@ -1161,61 +1171,58 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		break;
 	case CTE_READ_INVALID:
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "read invalid %llx %lx",
+		WPRINTK(sio, "read invalid %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
+			bio_cur_bytes(bio));
 #endif
 		sio_start_prefetch(sio, bio);
 		break;
 	case CTE_READ_MISS:
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "read miss %llx %lx",
+		WPRINTK(sio, "read miss %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
+			bio_cur_bytes(bio));
 #endif
 		sio_start_prefetch(sio, bio);
 		break;
 	case CTE_LOOKUP_FAILED:
-#ifdef SSD_DEBUG
-		WPRINTK(sio, "lookup failure %llx %lx",
+		WPRINTK(sio, "lookup failure %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
-#endif
+			bio_cur_bytes(bio));
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
 		ssdcache_put_sio(sio);
 		break;
 	case CTE_WRITE_BUSY:
-#ifdef SSD_DEBUG
-		WPRINTK(sio, "write hit busy %llx %lx",
+		WPRINTK(sio, "write hit busy %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
-#endif
+			bio_cur_bytes(bio));
 		sio_start_busy(sio, bio);
 		break;
 	case CTE_WRITE_INVALID:
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "write hit invalid %llx %lx",
+		WPRINTK(sio, "write hit invalid %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
+			bio_cur_bytes(bio));
 #endif
 		bio->bi_bdev = sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
 		break;
 	case CTE_WRITE_CLEAN:
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "write hit clean %llx %lx",
+		WPRINTK(sio, "write hit clean %llx %u",
 			(unsigned long long)bio->bi_sector,
-			to_sector(bio->bi_size));
+			bio_cur_bytes(bio));
 #endif
 		bio->bi_bdev = sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
 		break;
 	case CTE_WRITE_MISS:
 #ifdef SSD_DEBUG
-		WPRINTK(sio, "write miss %llx",
-			(unsigned long long)bio->bi_sector);
+		WPRINTK(sio, "write miss %llx %u",
+			(unsigned long long)bio->bi_sector,
+			bio_cur_bytes(bio));
 #endif
 		bio->bi_bdev = sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
