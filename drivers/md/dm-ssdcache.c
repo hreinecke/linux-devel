@@ -71,7 +71,8 @@ struct ssdcache_te {
 	unsigned long atime;	/* Timestamp of the block's last access */
 	unsigned long count;    /* Number of accesses */
 	DECLARE_BITMAP(clean, DEFAULT_BLOCKSIZE);
-	unsigned long active;
+	DECLARE_BITMAP(target_busy, DEFAULT_BLOCKSIZE);
+	DECLARE_BITMAP(cache_busy, DEFAULT_BLOCKSIZE);
 	sector_t sector;	/* Sector number on target device */
 	struct ssdcache_md *md; /* Backlink to metadirectory */
 	struct rcu_head rcu;
@@ -91,8 +92,6 @@ struct ssdcache_ctx {
 	struct dm_io_client *iocp;
 	struct radix_tree_root md_tree;
 	spinlock_t cmd_lock;
-	struct list_head active_list;
-	spinlock_t active_lock;
 	unsigned long hash_bits;
 	unsigned long hash_shift;
 	unsigned long block_size;
@@ -359,23 +358,52 @@ static bool cte_is_clean(struct ssdcache_te *cte, unsigned long *mask)
 	return bitmap_equal(tmpmask, mask, DEFAULT_BLOCKSIZE);
 }
 
-static int sio_sector_is_busy(struct ssdcache_io *sio)
+static bool cte_cache_is_busy(struct ssdcache_te *cte, unsigned long *mask)
 {
-	unsigned long flags;
-	struct ssdcache_io *tmp;
-	int match = 0;
+	DECLARE_BITMAP(tmpmask, DEFAULT_BLOCKSIZE);
 
-	spin_lock_irqsave(&sio->sc->active_lock, flags);
-	list_for_each_entry(tmp, &sio->sc->active_list, active) {
-		if (tmp == sio)
-			continue;
-		if (tmp->bio_sector != sio->bio_sector)
-			continue;
-		if (bitmap_intersects(tmp->bio_mask, sio->bio_mask,
-				      DEFAULT_BLOCKSIZE))
-			match++;
-	}
-	spin_unlock_irqrestore(&sio->sc->active_lock, flags);
+	bitmap_and(tmpmask, cte->cache_busy, mask, DEFAULT_BLOCKSIZE);
+	return !bitmap_empty(tmpmask, DEFAULT_BLOCKSIZE);
+}
+
+static bool cte_target_is_busy(struct ssdcache_te *cte, unsigned long *mask)
+{
+	DECLARE_BITMAP(tmpmask, DEFAULT_BLOCKSIZE);
+
+	bitmap_and(tmpmask, cte->target_busy, mask, DEFAULT_BLOCKSIZE);
+	return !bitmap_empty(tmpmask, DEFAULT_BLOCKSIZE);
+}
+
+static bool sio_cache_is_busy(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *cte;
+	bool match = false;
+
+	if (!sio || !sio->cmd || sio->cte_idx == -1)
+		return false;
+
+	rcu_read_lock();
+	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
+	if (cte)
+		match = cte_cache_is_busy(cte, sio->bio_mask);
+	rcu_read_unlock();
+
+	return match;
+}
+
+static bool sio_target_is_busy(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *cte;
+	bool match = false;
+
+	if (!sio || !sio->cmd || sio->cte_idx == -1)
+		return false;
+
+	rcu_read_lock();
+	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
+	if (cte)
+		match = cte_target_is_busy(cte, sio->bio_mask);
+	rcu_read_unlock();
 
 	return match;
 }
@@ -408,8 +436,10 @@ static void sio_cleanup_cte(struct ssdcache_io *sio)
 
 	rcu_read_lock();
 	oldcte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
-	if (oldcte && oldcte->active == 1)
-		is_invalid = bitmap_empty(oldcte->clean, DEFAULT_BLOCKSIZE);
+	if (bitmap_empty(oldcte->clean, DEFAULT_BLOCKSIZE) &&
+	    bitmap_empty(oldcte->target_busy, DEFAULT_BLOCKSIZE) &&
+	    bitmap_empty(oldcte->cache_busy, DEFAULT_BLOCKSIZE))
+		is_invalid = true;
 	rcu_read_unlock();
 
 	if (!is_invalid) {
@@ -422,20 +452,21 @@ static void sio_cleanup_cte(struct ssdcache_io *sio)
 	}
 
 	spin_lock_irq(&sio->cmd->lock);
-	oldcte = sio->cmd->te[sio->cte_idx];
-	if (oldcte)
-		*newcte = *oldcte;
+	if (newcte) {
+		oldcte = sio->cmd->te[sio->cte_idx];
+		if (oldcte)
+			*newcte = *oldcte;
 
-	newcte->atime = jiffies;
-	newcte->count++;
-	newcte->active--;
+		newcte->atime = jiffies;
+		newcte->count++;
+	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
 	if (oldcte)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
-static void sio_update_cte(struct ssdcache_io *sio, bool do_update)
+static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
 {
 	struct ssdcache_te *newcte, *oldcte;
 
@@ -454,15 +485,23 @@ static void sio_update_cte(struct ssdcache_io *sio, bool do_update)
 
 	newcte->atime = jiffies;
 	newcte->count++;
-	if (!sio->error) {
-		if (do_update) {
-			bitmap_or(newcte->clean, oldcte->clean, sio->bio_mask,
-				  DEFAULT_BLOCKSIZE);
-		}
-	} else {
+	/* Reset busy bitmaps */
+	if (is_cache)
+		bitmap_andnot(newcte->cache_busy, oldcte->cache_busy,
+			      sio->bio_mask, DEFAULT_BLOCKSIZE);
+	else
+		bitmap_andnot(newcte->target_busy, oldcte->target_busy,
+			      sio->bio_mask, DEFAULT_BLOCKSIZE);
+
+	/* Upon error always reset the clean bitmap */
+	if (sio->error)
 		bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
 			      DEFAULT_BLOCKSIZE);
-	}
+	/* And update the clean bitmap if it was a cache write */
+	else if (is_cache)
+			bitmap_or(newcte->clean, oldcte->clean, sio->bio_mask,
+				  DEFAULT_BLOCKSIZE);
+
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
 	if (oldcte)
@@ -483,10 +522,9 @@ static void sio_invalidate(struct ssdcache_io *sio)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
-static void sio_start_write(struct ssdcache_io *sio)
+static void sio_start_cache_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
-	unsigned long flags;
 
 	if (!sio || !sio->cmd || sio->cte_idx == -1)
 		return;
@@ -502,8 +540,9 @@ static void sio_start_write(struct ssdcache_io *sio)
 		*newcte = *oldcte;
 
 	newcte->count++;
-	newcte->active++;
 	bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
+		   DEFAULT_BLOCKSIZE);
+	bitmap_and(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
 	newcte->atime = jiffies;
 
@@ -511,11 +550,34 @@ static void sio_start_write(struct ssdcache_io *sio)
 	spin_unlock_irq(&sio->cmd->lock);
 	if (oldcte)
 		call_rcu(&oldcte->rcu, cte_reset);
+}
 
-	spin_lock_irqsave(&sio->sc->active_lock, flags);
-	if (list_empty(&sio->active))
-		list_add(&sio->active, &sio->sc->active_list);
-	spin_unlock_irqrestore(&sio->sc->active_lock, flags);
+static void sio_start_target_write(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *newcte, *oldcte;
+
+	if (!sio || !sio->cmd || sio->cte_idx == -1)
+		return;
+
+	/* Check if we should drop the old cte */
+	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
+	if (!newcte)
+		return;
+
+	spin_lock_irq(&sio->cmd->lock);
+	oldcte = sio->cmd->te[sio->cte_idx];
+	if (oldcte)
+		*newcte = *oldcte;
+
+	newcte->count++;
+	bitmap_and(newcte->target_busy, oldcte->target_busy, sio->bio_mask,
+		   DEFAULT_BLOCKSIZE);
+	newcte->atime = jiffies;
+
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
+	spin_unlock_irq(&sio->cmd->lock);
+	if (oldcte)
+		call_rcu(&oldcte->rcu, cte_reset);
 }
 
 /*
@@ -542,15 +604,12 @@ static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_ctx *sc)
 static void ssdcache_destroy_sio(struct kref *kref)
 {
 	struct ssdcache_io *sio = container_of(kref, struct ssdcache_io, kref);
-	unsigned long flags;
 
 	BUG_ON(!list_empty(&sio->list));
 
-	spin_lock_irqsave(&sio->sc->active_lock, flags);
-	list_del(&sio->active);
-	spin_unlock_irqrestore(&sio->sc->active_lock, flags);
-
-	if (sio_match_sector(sio) && !sio_sector_is_busy(sio))
+	if (sio_match_sector(sio) &&
+	    !sio_cache_is_busy(sio) &&
+	    !sio_target_is_busy(sio))
 		sio_cleanup_cte(sio);
 
 	mempool_free(sio, _sio_pool);
@@ -603,41 +662,43 @@ static void finish_reserved(struct ssdcache_io *sio, unsigned long error)
 	}
 }
 
-static void io_callback(unsigned long error, void *context)
+static void cache_io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
-	struct bio *bio = sio->bio;
-	bool mark_clean;
 
-	if (bio) {
-		mark_clean = bio->bi_bdev == sio->sc->cache_dev->bdev;
+	if (!sio_match_sector(sio)) {
+		WPRINTK(sio, "cte overrun, not updating state");
+	} else if (!sio_cache_is_busy(sio)) {
+		WPRINTK(sio, "cte not busy, not updating state");
 	} else {
-		bio = sio->writeback_bio;
-		mark_clean = true;
-	}
-
-	if (!bio) {
-		/* This is wrong ... */
-		WPRINTK(sio, "no bio");
-		goto out;
-	}
-
-	if (bio_data_dir(bio) == WRITE) {
-		if (!sio_match_sector(sio)) {
-			WPRINTK(sio, "cte overrun, not updating state");
-		} else if (sio_sector_is_busy(sio)) {
-			WPRINTK(sio, "cte busy, not updating state");
-		} else {
-			if (error || sio->error) {
-				WPRINTK(sio, "finished with %lu", error);
-				sio->error = error;
-			}
-			sio_update_cte(sio, mark_clean);
+		if (error || sio->error) {
+			WPRINTK(sio, "finished with %lu", error);
+			sio->error = error;
 		}
+		sio_update_cte(sio, true);
 	}
 	finish_reserved(sio, error);
 
-out:
+	ssdcache_put_sio(sio);
+	queue_work(_ssdcached_wq, &_ssdcached_work);
+}
+
+static void target_io_callback(unsigned long error, void *context)
+{
+	struct ssdcache_io *sio = context;
+
+	if (!sio_match_sector(sio)) {
+		WPRINTK(sio, "cte overrun, not updating state");
+	} else if (!sio_target_is_busy(sio)) {
+		WPRINTK(sio, "cte not busy, not updating state");
+	} else {
+		if (error || sio->error) {
+			WPRINTK(sio, "finished with %lu", error);
+			sio->error = error;
+		}
+		sio_update_cte(sio, false);
+	}
+
 	ssdcache_put_sio(sio);
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
@@ -673,7 +734,7 @@ static void write_to_cache(struct ssdcache_io *sio, struct bio *bio)
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
 	iorq.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx;
-	iorq.notify.fn = io_callback;
+	iorq.notify.fn = cache_io_callback;
 	iorq.notify.context = sio;
 	iorq.client = sio->sc->iocp;
 
@@ -692,7 +753,7 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
 	iorq.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx;
-	iorq.notify.fn = io_callback;
+	iorq.notify.fn = target_io_callback;
 	iorq.notify.context = sio;
 	iorq.client = sio->sc->iocp;
 
@@ -717,14 +778,12 @@ static void sio_start_read_hit(struct ssdcache_io *sio, struct bio *bio)
 static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
 {
 	sio->sc->cache_busy++;
-	sio_invalidate(sio);
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
 
 static bool sio_start_writeback(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *cte;
-	DECLARE_BITMAP(tmpmask, DEFAULT_BLOCKSIZE);
 
 	if (!sio || !sio->cmd || sio->cte_idx == -1)
 		return false;
@@ -743,20 +802,24 @@ static bool sio_start_writeback(struct ssdcache_io *sio)
 		return false;
 	}
 
-	bitmap_and(tmpmask, cte->clean, sio->bio_mask,
-		   DEFAULT_BLOCKSIZE);
-	if (bitmap_equal(tmpmask, sio->bio_mask, DEFAULT_BLOCKSIZE) ||
-	    !cte->active) {
-		sio_start_write(sio);
-		return true;
+	/* Check if there is an outstanding cache write */
+	if (cte_cache_is_busy(cte, sio->bio_mask)) {
+		WPRINTK(sio, "cache sector busy");
+		return false;
 	}
-
-	if (sio_sector_is_busy(sio)) {
-		WPRINTK(sio, "sector busy");
+	/* Check if there is an outstanding target write */
+	/*
+	 * Danger Will Robinson
+	 * There is no guarantee that two writes to the same
+	 * block are handled separate.
+	 * Need to check the block layer details here.
+	 */
+	if (cte_target_is_busy(cte, sio->bio_mask)) {
+		WPRINTK(sio, "target sector busy");
 		return false;
 	}
 
-	sio_start_write(sio);
+	sio_start_cache_write(sio);
 	return true;
 }
 /*
@@ -860,21 +923,20 @@ retry:
 			if (cte_is_clean(cte, sio->bio_mask)) {
 				/* Clean cte */
 				if (rw == WRITE) {
-					sio_start_write(sio);
+					sio_start_cache_write(sio);
 					return CTE_WRITE_CLEAN;
 				}
 				return CTE_READ_CLEAN;
-			} else if (cte->active) {
+			} else if (cte_cache_is_busy(cte, sio->bio_mask)) {
 				/* Busy cte */
 				if (rw == WRITE) {
-					sio_start_write(sio);
 					return CTE_WRITE_BUSY;
 				}
 				return CTE_READ_BUSY;
 			} else {
 				/* Invalid cte sector */
 				if (rw == WRITE) {
-					sio_start_write(sio);
+					sio_start_cache_write(sio);
 					return CTE_WRITE_INVALID;
 				}
 				return CTE_READ_INVALID;
@@ -943,7 +1005,8 @@ found:
 		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
 		if (rw == WRITE) {
-			newcte->active++;
+			bitmap_and(newcte->cache_busy, oldcte->cache_busy,
+				   sio->bio_mask, DEFAULT_BLOCKSIZE);
 			retval = CTE_WRITE_MISS;
 		} else {
 			retval = CTE_READ_MISS;
@@ -953,15 +1016,6 @@ found:
 		spin_unlock_irq(&sio->cmd->lock);
 		if (oldcte)
 			call_rcu(&oldcte->rcu, cte_reset);
-		if (rw == WRITE) {
-			unsigned long flags;
-
-			spin_lock_irqsave(&sio->sc->active_lock, flags);
-			if (list_empty(&sio->active))
-				list_add(&sio->active, &sio->sc->active_list);
-			spin_unlock_irqrestore(&sio->sc->active_lock, flags);
-		}
-
 	} else {
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s (cte %lx:ff): %d ctes busy", sio->nr,
@@ -995,18 +1049,23 @@ static void process_sio(struct work_struct *ignored)
 				case CTE_WRITE_INVALID:
 				case CTE_WRITE_CLEAN:
 				case CTE_WRITE_MISS:
-				case CTE_WRITE_BUSY:
 					ssdcache_get_sio(sio);
 					write_to_cache(sio, sio->bio);
 					break;
+				case CTE_WRITE_BUSY:
+					WPRINTK(sio, "cte busy for write");
+					sio->error = EBUSY;
+					sio->sc->cache_busy++;
+					break;
 				default:
-					WPRINTK(sio, "invalid writethrough cte");
+					WPRINTK(sio, "invalid cte lookup %d",
+						ret);
 					sio->error = ENOENT;
 					sio->sc->cache_overruns++;
 				}
 			} else {
 				ssdcache_get_sio(sio);
-				sio_start_write(sio);
+				sio_start_target_write(sio);
 				write_to_target(sio, sio->bio);
 			}
 			bio_put(sio->bio);
@@ -1186,17 +1245,23 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	}
 
 	if (bio_data_dir(bio) == WRITE) {
-		bool mark_clean = bio->bi_bdev == sio->sc->cache_dev->bdev;
+		bool to_cache = bio->bi_bdev == sio->sc->cache_dev->bdev;
 		if (!sio_match_sector(sio)) {
 			WPRINTK(sio, "cte overrun, not updating state");
-		} else if (sio_sector_is_busy(sio)) {
-			WPRINTK(sio, "cte busy, not updating state");
+		} else if (to_cache) {
+			if (!sio_cache_is_busy(sio)) {
+				WPRINTK(sio, "cte not busy, not updating");
+			} else {
+				sio_update_cte(sio, to_cache);
+			}
 		} else {
-			/* Mark sector as clean if the cache write suceeded */
-			sio_update_cte(sio, mark_clean);
+			if (!sio_target_is_busy(sio)) {
+				WPRINTK(sio, "cte not busy, not updating");
+			} else {
+				sio_update_cte(sio, to_cache);
+			}
 		}
-	}
-	if (sio->writeback_bio) {
+	} else if (sio->writeback_bio) {
 		/* Setup clone for writing to cache device */
 		clone = bio_clone(sio->writeback_bio, GFP_NOWAIT);
 		clone->bi_rw |= WRITE;
@@ -1297,8 +1362,6 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	spin_lock_init(&sc->cmd_lock);
-	spin_lock_init(&sc->active_lock);
-	INIT_LIST_HEAD(&sc->active_list);
 
 	cdev_size = i_size_read(sc->cache_dev->bdev->bd_inode);
 	tdev_size = i_size_read(sc->target_dev->bdev->bd_inode);
