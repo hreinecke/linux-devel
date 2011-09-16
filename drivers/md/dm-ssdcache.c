@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-// #define SSD_DEBUG
+#define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -83,6 +83,7 @@ struct ssdcache_md {
 	unsigned long hash;	/* Hash number */
 	unsigned int num_cte;	/* Number of table entries */
 	unsigned long atime;
+	struct ssdcache_ctx *sc;
 	struct ssdcache_te *te[DEFAULT_ASSOCIATIVITY];	/* RCU Table entries */
 };
 
@@ -98,6 +99,8 @@ struct ssdcache_ctx {
 	unsigned long block_mask;
 	sector_t data_offset;
 	unsigned long nr_sio;
+	unsigned long sio_active;
+	unsigned long cte_active;
 	enum ssdcache_mode_t cache_mode;
 	enum ssdcache_strategy_t cache_strategy;
 	unsigned long cache_misses;
@@ -268,6 +271,7 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_ctx *sc,
 	cmd->num_cte = (1UL << sc->hash_shift) * DEFAULT_ASSOCIATIVITY;
 	spin_lock_init(&cmd->lock);
 	cmd->atime = jiffies;
+	cmd->sc = sc;
 
 	if (radix_tree_preload(GFP_NOIO)) {
 		mempool_free(cmd, _cmd_pool);
@@ -340,6 +344,7 @@ struct ssdcache_te * cte_new(struct ssdcache_ctx *sc, struct ssdcache_md *cmd,
 	newcte->atime = jiffies;
 	newcte->count = 1;
 	newcte->md = cmd;
+	sc->cte_active++;
 	return newcte;
 }
 
@@ -347,6 +352,7 @@ static void cte_reset(struct rcu_head *rp)
 {
 	struct ssdcache_te *cte = container_of(rp, struct ssdcache_te, rcu);
 
+	cte->md->sc->cte_active--;
 	mempool_free(cte, _cte_pool);
 }
 
@@ -599,6 +605,7 @@ static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_ctx *sc)
 	sio->sc = sc;
 	sio->cte_idx = -1;
 	sio->nr = ++sc->nr_sio;
+	sc->sio_active++;
 	kref_init(&sio->kref);
 	INIT_LIST_HEAD(&sio->list);
 	INIT_LIST_HEAD(&sio->active);
@@ -624,7 +631,7 @@ static void ssdcache_destroy_sio(struct kref *kref)
 	    !sio_cache_is_busy(sio) &&
 	    !sio_target_is_busy(sio))
 		sio_cleanup_cte(sio);
-
+	sio->sc->sio_active--;
 	mempool_free(sio, _sio_pool);
 }
 
@@ -654,14 +661,7 @@ static void ssdcache_schedule_sio(struct ssdcache_io *sio)
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
-/*
- * finish_reserved
- *
- * Finish I/O for cte in RESERVED
- * Data has been written to cache device.
- * Finish I/O and complete sio item.
- */
-static void finish_reserved(struct ssdcache_io *sio, unsigned long error)
+static void unmap_writeback_bio(struct ssdcache_io *sio)
 {
 	int i;
 	struct bio_vec *bvec;
@@ -690,7 +690,7 @@ static void cache_io_callback(unsigned long error, void *context)
 		}
 		sio_update_cte(sio, true);
 	}
-	finish_reserved(sio, error);
+	unmap_writeback_bio(sio);
 
 	ssdcache_put_sio(sio);
 	queue_work(_ssdcached_wq, &_ssdcached_work);
@@ -742,11 +742,11 @@ static void write_to_cache(struct ssdcache_io *sio, struct bio *bio)
 
 	cache.bdev = sio->sc->cache_dev->bdev;
 	cache.sector = to_cache_sector(sio, bio->bi_sector);
-	cache.count = to_sector(bio_cur_bytes(bio));
+	cache.count = bio_sectors(bio);
 
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx;
+	iorq.mem.ptr.bvec = bio_iovec(bio);
 	iorq.notify.fn = cache_io_callback;
 	iorq.notify.context = sio;
 	iorq.client = sio->sc->iocp;
@@ -761,11 +761,11 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 	target.bdev = sio->sc->target_dev->bdev;
 	target.sector = bio->bi_sector;
-	target.count = to_sector(bio_cur_bytes(bio));
+	target.count = bio_sectors(bio);
 
 	iorq.bi_rw = WRITE;
 	iorq.mem.type = DM_IO_BVEC;
-	iorq.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx;
+	iorq.mem.ptr.bvec = bio_iovec(bio);
 	iorq.notify.fn = target_io_callback;
 	iorq.notify.context = sio;
 	iorq.client = sio->sc->iocp;
@@ -775,9 +775,15 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 {
+	struct bio_vec *bvec;
+	int i;
+
+	/* Setup clone for writing to cache device */
+	sio->writeback_bio = bio_clone(bio, GFP_NOWAIT);
+	sio->writeback_bio->bi_rw |= WRITE;
+	bio_for_each_segment(bvec, sio->writeback_bio, i)
+		get_page(bvec->bv_page);
 	sio->sc->cache_misses++;
-	sio->writeback_bio = bio;
-	bio_get(bio);
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
 
@@ -928,7 +934,7 @@ retry:
 		cte = rcu_dereference(sio->cmd->te[i]);
 		rcu_read_unlock();
 		if (!cte) {
-			if (invalid < 0)
+			if (invalid == -1)
 				invalid = i;
 			continue;
 		}
@@ -991,7 +997,7 @@ retry:
 			}
 		}
 	}
-	if (invalid < 0 && assoc > 0) {
+	if (invalid == -1 && assoc > 0) {
 		hash_number = rotate(sio->sc, hash_number);
 		assoc--;
 #ifdef SSD_DEBUG
@@ -1005,8 +1011,8 @@ found:
 		index = invalid;
 	} else if (oldest != -1) {
 #ifdef SSD_DEBUG
-		DPRINTK("%s (cte %lx:%x): drop oldest cte", __FUNCTION__,
-			sio->cmd->hash, oldest);
+		DPRINTK("%lu: %s (cte %lx:%x): drop oldest cte", sio->nr,
+			__FUNCTION__, sio->cmd->hash, oldest);
 #endif
 		sio->sc->cache_evictions++;
 		index = oldest;
@@ -1017,7 +1023,13 @@ found:
 		struct ssdcache_te *oldcte, *newcte;
 
 		newcte = cte_new(sio->sc, sio->cmd, index);
-		BUG_ON(!newcte);
+		if (!newcte) {
+			/* Ouch */
+			sio->cte_idx = -1;
+			DPRINTK("%lu: %s (cte %lx:ff): oom", sio->nr,
+				__FUNCTION__, sio->cmd->hash);
+			return retval;
+		}
 		spin_lock_irq(&sio->cmd->lock);
 		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
@@ -1088,11 +1100,11 @@ static void process_sio(struct work_struct *ignored)
 		} else if (sio->writeback_bio) {
 			if (!sio_start_writeback(sio)) {
 				WPRINTK(sio, "cancel writeback");
+				unmap_writeback_bio(sio);
 				sio->error = ENOENT;
 				sio->sc->cache_overruns++;
 			} else {
 				/* Start writing to cache device */
-				WPRINTK(sio, "start writeback");
 				ssdcache_get_sio(sio);
 				write_to_cache(sio, sio->writeback_bio);
 			}
@@ -1149,6 +1161,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 
 		/* Kick off secondary writes */
 		sio->bio = bio_clone(bio, GFP_NOWAIT);
+		BUG_ON(!sio->bio);
 		bio_for_each_segment(bvec, sio->bio, i)
 			get_page(bvec->bv_page);
 		ssdcache_schedule_sio(sio);
@@ -1244,9 +1257,6 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 			  int error, union map_info *map_context)
 {
 	struct ssdcache_io *sio = map_context->ptr;
-	struct bio *clone = NULL;
-	struct bio_vec *bvec;
-	int i;
 
 	if (!sio)
 		return 0;
@@ -1254,10 +1264,7 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	if (error || sio->error) {
 		WPRINTK(sio, "finished with %u", error);
 		sio->error = error;
-		if (sio->writeback_bio) {
-			bio_put(sio->writeback_bio);
-			sio->writeback_bio = NULL;
-		}
+		unmap_writeback_bio(sio);
 	}
 
 	if (bio_data_dir(bio) == WRITE) {
@@ -1278,13 +1285,7 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 			}
 		}
 	} else if (sio->writeback_bio) {
-		/* Setup clone for writing to cache device */
-		clone = bio_clone(sio->writeback_bio, GFP_NOWAIT);
-		clone->bi_rw |= WRITE;
-		bio_for_each_segment(bvec, sio->writeback_bio, i)
-			get_page(bvec->bv_page);
-		bio_put(sio->writeback_bio);
-		sio->writeback_bio = clone;
+		/* Kick off writeback */
 		ssdcache_schedule_sio(sio);
 	}
 
@@ -1483,12 +1484,13 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
 			 "cache misses %lu hits %lu busy %lu overruns %lu "
-			 "bypassed %lu evicts %lu failures %lu",
+			 "bypassed %lu evicts %lu failures %lu sio %lu cte %lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
-			 sc->cache_evictions, sc->cache_failures);
+			 sc->cache_evictions, sc->cache_failures,
+			 sc->sio_active, sc->cte_active - nr_ctes);
 		break;
 
 	case STATUSTYPE_TABLE:
