@@ -556,6 +556,38 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 		      DEFAULT_BLOCKSIZE);
 	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
+	/* Caveat: target write might already be running here */
+	bitmap_or(newcte->target_busy, oldcte->target_busy, sio->bio_mask,
+		   DEFAULT_BLOCKSIZE);
+	newcte->atime = jiffies;
+
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
+	spin_unlock_irq(&sio->cmd->lock);
+	call_rcu(&oldcte->rcu, cte_reset);
+}
+
+static void sio_start_writeback(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *newcte, *oldcte;
+
+	if (!sio || !sio->cmd || sio->cte_idx == -1)
+		return;
+
+	/* Check if we should drop the old cte */
+	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
+	if (!newcte)
+		return;
+
+	spin_lock_irq(&sio->cmd->lock);
+	oldcte = sio->cmd->te[sio->cte_idx];
+	BUG_ON(!oldcte);
+	*newcte = *oldcte;
+
+	newcte->count++;
+	bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
+		      DEFAULT_BLOCKSIZE);
+	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
+		   DEFAULT_BLOCKSIZE);
 	newcte->atime = jiffies;
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
@@ -700,7 +732,9 @@ static void target_io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	if (!sio_match_sector(sio)) {
+	is (!sio->cmd) {
+		WPRINTK(sio, "cte lookup not completed");
+	} else if (!sio_match_sector(sio)) {
 		WPRINTK(sio, "cte overrun, not updating state");
 	} else if (!sio_target_is_busy(sio)) {
 		WPRINTK(sio, "cte not busy, not updating state");
@@ -1041,6 +1075,8 @@ found:
 		if (rw == WRITE) {
 			bitmap_or(newcte->cache_busy, newcte->cache_busy,
 				   sio->bio_mask, DEFAULT_BLOCKSIZE);
+			bitmap_or(newcte->target_busy, newcte->target_busy,
+				   sio->bio_mask, DEFAULT_BLOCKSIZE);
 			retval = CTE_WRITE_MISS;
 		} else {
 			retval = CTE_READ_MISS;
@@ -1111,7 +1147,7 @@ static void process_sio(struct work_struct *ignored)
 			} else {
 				/* Start writing to cache device */
 				ssdcache_get_sio(sio);
-				sio_start_cache_write(sio);
+				sio_start_writeback(sio);
 				write_to_cache(sio, sio->writeback_bio);
 			}
 		} else {
@@ -1266,6 +1302,10 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	if (!sio)
 		return error;
 
+	if (!sio->cmd) {
+		WPRINTK(sio, "cte lookup not completed");
+		sio->error = -EAGAIN;
+	}
 	if (error || sio->error) {
 		WPRINTK(sio, "finished with %u", error);
 		sio->error = error;
