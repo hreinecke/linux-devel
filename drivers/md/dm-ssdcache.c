@@ -114,7 +114,7 @@ struct ssdcache_ctx {
 
 struct ssdcache_io {
 	struct list_head list;
-	struct list_head active;
+	wait_queue_head_t wait;
 	struct kref kref;
 	unsigned long nr;
 	struct ssdcache_ctx *sc;
@@ -640,7 +640,7 @@ static struct ssdcache_io *ssdcache_create_sio(struct ssdcache_ctx *sc)
 	sc->sio_active++;
 	kref_init(&sio->kref);
 	INIT_LIST_HEAD(&sio->list);
-	INIT_LIST_HEAD(&sio->active);
+	init_waitqueue_head(&sio->wait);
 	return sio;
 }
 
@@ -693,6 +693,26 @@ static void ssdcache_schedule_sio(struct ssdcache_io *sio)
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
+static void sio_wait_for_lookup(struct ssdcache_io *sio)
+{
+	DEFINE_WAIT(wait);
+
+	BUG_ON(waitqueue_active(&sio->wait));
+	spin_lock_irq(&sio->cmd->lock);
+	prepare_to_wait_exclusive(&sio->wait, &wait, TASK_UNINTERRUPTIBLE);
+	spin_unlock_irq(&sio->cmd->lock);
+	io_schedule();
+	spin_lock_irq(&sio->cmd->lock);
+	finish_wait(&sio->wait, &wait);
+	spin_unlock_irq(&sio->cmd->lock);
+}
+
+static void sio_wake_on_lookup(struct ssdcache_io *sio)
+{
+	if (waitqueue_active(&sio->wait))
+		wake_up(&sio->wait);
+}
+
 static void unmap_writeback_bio(struct ssdcache_io *sio)
 {
 	int i;
@@ -732,9 +752,11 @@ static void target_io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	is (!sio->cmd) {
-		WPRINTK(sio, "cte lookup not completed");
-	} else if (!sio_match_sector(sio)) {
+	if (!sio->cmd) {
+		WPRINTK(sio, "wait for cte lookup");
+		sio_wait_for_lookup(sio);
+	}
+	if (!sio_match_sector(sio)) {
 		WPRINTK(sio, "cte overrun, not updating state");
 	} else if (!sio_target_is_busy(sio)) {
 		WPRINTK(sio, "cte not busy, not updating state");
@@ -953,7 +975,8 @@ retry:
 		if (!sio->cmd) {
 			DPRINTK("cmd insertion failure");
 			sio->sc->cache_failures++;
-			return CTE_LOOKUP_FAILED;
+			retval = CTE_LOOKUP_FAILED;
+			goto out;
 		} else {
 #ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:0): use first clean entry",
@@ -983,24 +1006,28 @@ retry:
 				/* Clean cte */
 				if (rw == WRITE) {
 					sio_start_cache_write(sio);
-					return CTE_WRITE_CLEAN;
+					retval = CTE_WRITE_CLEAN;
+				} else {
+					retval = CTE_READ_CLEAN;
 				}
-				return CTE_READ_CLEAN;
 			} else if (cte_target_is_busy(cte, sio->bio_mask) ||
 				   cte_cache_is_busy(cte, sio->bio_mask)) {
 				/* Busy cte */
 				if (rw == WRITE) {
-					return CTE_WRITE_BUSY;
+					retval = CTE_WRITE_BUSY;
+				} else {
+					retval = CTE_READ_BUSY;
 				}
-				return CTE_READ_BUSY;
 			} else {
 				/* Invalid cte sector */
 				if (rw == WRITE) {
 					sio_start_cache_write(sio);
-					return CTE_WRITE_INVALID;
+					retval = CTE_WRITE_INVALID;
+				} else {
+					retval = CTE_READ_INVALID;
 				}
-				return CTE_READ_INVALID;
 			}
+			goto out;
 		}
 		/* Break out if we have found an invalid entry */
 		if (invalid != -1)
@@ -1093,6 +1120,8 @@ found:
 #endif
 		sio->cte_idx = -1;
 	}
+out:
+	sio_wake_on_lookup(sio);
 	return retval;
 }
 
@@ -1303,8 +1332,8 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		return error;
 
 	if (!sio->cmd) {
-		WPRINTK(sio, "cte lookup not completed");
-		sio->error = -EAGAIN;
+		WPRINTK(sio, "wait for cte lookup");
+		sio_wait_for_lookup(sio);
 	}
 	if (error || sio->error) {
 		WPRINTK(sio, "finished with %u", error);
