@@ -166,6 +166,7 @@ enum cte_match_t {
 	CTE_WRITE_BUSY,
 	CTE_WRITE_INVALID,
 	CTE_WRITE_MISS,
+	CTE_WRITE_DONE,
 	CTE_WRITE_ERROR,
 	CTE_LOOKUP_FAILED,
 };
@@ -386,8 +387,8 @@ static bool sio_cache_is_busy(struct ssdcache_io *sio)
 	struct ssdcache_te *cte;
 	bool match = false;
 
-	BUG_ON(!sio);
-	BUG_ON(!sio->cmd);
+	if (!sio->cmd)
+		return false;
 	BUG_ON(sio->cte_idx == -1);
 
 	rcu_read_lock();
@@ -404,7 +405,7 @@ static bool sio_target_is_busy(struct ssdcache_io *sio)
 	struct ssdcache_te *cte;
 	bool match = false;
 
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
+	if (!sio->cmd || sio->cte_idx == -1)
 		return false;
 
 	rcu_read_lock();
@@ -558,7 +559,6 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
 	if (sio->error == -EUCLEAN) {
-		/* Target write has already completed */
 		sio->error = 0;
 	} else {
 		bitmap_or(newcte->target_busy, oldcte->target_busy,
@@ -744,6 +744,7 @@ static void target_io_callback(unsigned long error, void *context)
 #endif
 		if (!sio->error)
 			sio->error = -EUCLEAN;
+		sio->sc->cache_overruns++;
 	} else if (!sio_match_sector(sio)) {
 		WPRINTK(sio, "cte overrun, not updating state");
 	} else if (!sio_target_is_busy(sio)) {
@@ -959,6 +960,10 @@ retry:
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
 	if (!sio->cmd) {
+		if (sio->error == -EUCLEAN) {
+			/* Target write already completed */
+			return CTE_WRITE_DONE;
+		}
 		sio->cmd = cmd_insert(sio->sc, hash_number);
 		if (!sio->cmd) {
 			DPRINTK("%lu: %s: cmd insertion failure",
@@ -991,10 +996,7 @@ retry:
 		}
 		if (cte->sector == sio->bio_sector) {
 			sio->cte_idx = i;
-			if (rw == WRITE && sio->error &&
-			    sio->error != -EUCLEAN) {
-				retval = CTE_WRITE_ERROR;
-			} else if (cte_is_clean(cte, sio->bio_mask)) {
+			if (cte_is_clean(cte, sio->bio_mask)) {
 				/* Clean cte */
 				if (rw == WRITE) {
 					sio_start_cache_write(sio);
@@ -1022,7 +1024,7 @@ retry:
 			goto out;
 		}
 		/* Break out if we have found an invalid entry */
-		if (invalid != -1)
+		if (invalid != -1 || sio->error == -EUCLEAN)
 			break;
 		/* Can only eject CLEAN entries */
 		if (!cte_is_clean(cte, sio->bio_mask) ||
@@ -1074,8 +1076,10 @@ found:
 #endif
 		sio->sc->cache_evictions++;
 		index = oldest;
-	} else
+	} else {
 		index = -1;
+		sio->error - 0;
+	}
 
 	if (index != -1) {
 		struct ssdcache_te *oldcte, *newcte;
@@ -1092,22 +1096,11 @@ found:
 		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
 		if (rw == WRITE) {
-			if (sio->error && sio->error != -EUCLEAN) {
-				retval = CTE_WRITE_ERROR;
-			} else {
-				bitmap_or(newcte->cache_busy,
-					  newcte->cache_busy,
-					  sio->bio_mask, DEFAULT_BLOCKSIZE);
-				if (sio->error == -EUCLEAN) {
-					sio->error = 0;
-				} else {
-					bitmap_or(newcte->target_busy,
-						  newcte->target_busy,
-						  sio->bio_mask,
-						  DEFAULT_BLOCKSIZE);
-				}
-				retval = CTE_WRITE_MISS;
-			}
+			bitmap_or(newcte->cache_busy, newcte->cache_busy,
+				  sio->bio_mask, DEFAULT_BLOCKSIZE);
+			bitmap_or(newcte->target_busy, newcte->target_busy,
+				  sio->bio_mask, DEFAULT_BLOCKSIZE);
+			retval = CTE_WRITE_MISS;
 		} else {
 			retval = CTE_READ_MISS;
 		}
@@ -1157,6 +1150,10 @@ static void process_sio(struct work_struct *ignored)
 					WPRINTK(sio, "cte busy for write");
 					sio->error = -EBUSY;
 					sio->sc->cache_busy++;
+					break;
+				case CTE_WRITE_DONE:
+					DPRINTK("%lu: %s: cte already done",
+						sio->nr, __FUNCTION__);
 					break;
 				case CTE_WRITE_ERROR:
 					WPRINTK(sio, "cte target write fail");
@@ -1294,6 +1291,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		map_context->ptr = NULL;
 		ssdcache_put_sio(sio);
 		break;
+	case CTE_WRITE_DONE:
+		/* Write to target already completed */
+		DPRINTK("%lu: %s: write target done", sio->nr, __FUNCTION__);
+		map_context->ptr = NULL;
+		bio_endio(bio, sio->error);
+		ssdcache_put_sio(sio);
+		return DM_MAPIO_SUBMITTED;
+		break;
 	case CTE_WRITE_ERROR:
 		WPRINTK(sio, "write target failure");
 		ssdcache_put_sio(sio);
@@ -1346,6 +1351,7 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		DPRINTK("%lu: %s: cte lookup not finished",
 			sio->nr, __FUNCTION__);
 #endif
+		sio->sc->cache_overruns++;
 		sio->error = -EUCLEAN;
 		goto out;
 	}
