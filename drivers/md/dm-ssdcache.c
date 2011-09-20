@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-#define SSD_DEBUG
+// #define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -967,6 +967,11 @@ retry:
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
 	if (!sio->cmd) {
+		if (rw == WRITE) {
+			/* Skip cte instantiation on WRITE */
+			sio->cte_idx = -1;
+			return retval;
+		}
 		if (sio->error) {
 			/* Target write already completed */
 			sio->cte_idx = -1;
@@ -1060,6 +1065,9 @@ retry:
 			busy++;
 			continue;
 		}
+		/* Skip cache eviction on WRITE */
+		if (rw == WRITE)
+			continue;
 		if (sio->sc->cache_strategy == CACHE_LRU) {
 			/* Select the oldest clean entry */
 			rcu_read_lock();
