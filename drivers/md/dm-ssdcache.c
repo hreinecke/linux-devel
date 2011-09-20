@@ -681,6 +681,18 @@ static void ssdcache_schedule_sio(struct ssdcache_io *sio)
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
+static void map_secondary_bio(struct ssdcache_io *sio, struct bio *bio)
+{
+	struct bio_vec *bvec;
+	int i;
+
+	/* Kick off secondary writes */
+	sio->bio = bio_clone(bio, GFP_NOWAIT);
+	BUG_ON(!sio->bio);
+	bio_for_each_segment(bvec, sio->bio, i)
+		get_page(bvec->bv_page);
+}
+
 static void map_writeback_bio(struct ssdcache_io *sio, struct bio *bio)
 {
 	struct bio_vec *bvec;
@@ -820,25 +832,8 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 	dm_io(&iorq, 1, &target, NULL);
 }
 
-static void ssdcache_start_secondary_sio(struct ssdcache_io *sio,
-					 struct bio *bio)
-{
-	struct bio_vec *bvec;
-	int i;
-
-	/* Kick off secondary writes */
-	sio->bio = bio_clone(bio, GFP_NOWAIT);
-	BUG_ON(!sio->bio);
-	bio_for_each_segment(bvec, sio->bio, i)
-		get_page(bvec->bv_page);
-	ssdcache_schedule_sio(sio);
-}
-
 static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 {
-	struct bio_vec *bvec;
-	int i;
-
 	/* Setup clone for writing to cache device */
 	map_writeback_bio(sio, bio);
 	sio->sc->cache_misses++;
@@ -866,7 +861,8 @@ static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
 		bio->bi_bdev = sio->sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
 	}
-	ssdcache_start_secondary_sio(sio, bio);
+	map_secondary_bio(sio, bio);
+	ssdcache_schedule_sio(sio);
 }
 
 static bool sio_check_writeback(struct ssdcache_io *sio)
@@ -1646,7 +1642,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
 			 "cache misses %lu hits %lu busy %lu overruns %lu "
 			 "bypassed %lu evicts %lu failures %lu sio %lu "
-			 "cte %lu (%%lu/%lu)",
+			 "cte %lu (%lu/%lu)",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
