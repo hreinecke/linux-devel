@@ -558,9 +558,7 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 		      DEFAULT_BLOCKSIZE);
 	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
-	if (sio->error == -EUCLEAN) {
-		sio->error = 0;
-	} else {
+	if (!sio->error) {
 		bitmap_or(newcte->target_busy, oldcte->target_busy,
 			  sio->bio_mask, DEFAULT_BLOCKSIZE);
 	}
@@ -721,9 +719,15 @@ static void cache_io_callback(unsigned long error, void *context)
 	} else if (!sio_cache_is_busy(sio)) {
 		WPRINTK(sio, "cte not busy, not updating state");
 	} else {
-		if (error || sio->error) {
+		if (error) {
 			WPRINTK(sio, "finished with %lu", error);
 			sio->error = error;
+		}
+		if (sio->error == -EUCLEAN) {
+#ifdef SSD_DEBUG
+			WPRINTK(sio, "reset EUCLEAN");
+#endif
+			sio->error = 0;
 		}
 		sio_update_cte(sio, true);
 	}
@@ -960,8 +964,9 @@ retry:
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
 	if (!sio->cmd) {
-		if (sio->error == -EUCLEAN) {
+		if (sio->error) {
 			/* Target write already completed */
+			sio->cte_idx = -1;
 			return CTE_WRITE_DONE;
 		}
 		sio->cmd = cmd_insert(sio->sc, hash_number);
@@ -969,6 +974,7 @@ retry:
 			DPRINTK("%lu: %s: cmd insertion failure",
 				sio->nr, __FUNCTION__);
 			sio->sc->cache_failures++;
+			sio->cte_idx = -1;
 			retval = CTE_LOOKUP_FAILED;
 			goto out;
 		} else {
@@ -1023,8 +1029,14 @@ retry:
 			}
 			goto out;
 		}
+		/*
+		 * Do not attempt to evict entries when
+		 * target writes have already completed.
+		 */
+		if (sio->error)
+			continue;
 		/* Break out if we have found an invalid entry */
-		if (invalid != -1 || sio->error == -EUCLEAN)
+		if (invalid != -1)
 			break;
 		/* Can only eject CLEAN entries */
 		if (!cte_is_clean(cte, sio->bio_mask) ||
@@ -1057,7 +1069,7 @@ retry:
 			}
 		}
 	}
-	if (invalid == -1 && assoc > 0) {
+	if (invalid == -1 && assoc > 0 && !sio->error) {
 		hash_number = rotate(sio->sc, hash_number);
 		assoc--;
 #ifdef SSD_DEBUG
@@ -1078,7 +1090,6 @@ found:
 		index = oldest;
 	} else {
 		index = -1;
-		sio->error - 0;
 	}
 
 	if (index != -1) {
@@ -1109,6 +1120,9 @@ found:
 		spin_unlock_irq(&sio->cmd->lock);
 		if (oldcte)
 			call_rcu(&oldcte->rcu, cte_reset);
+	} else if (sio->error) {
+		sio->cte_idx = -1;
+		retval = CTE_WRITE_DONE;
 	} else {
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s (cte %lx:ff): %d ctes busy", sio->nr,
@@ -1152,8 +1166,10 @@ static void process_sio(struct work_struct *ignored)
 					sio->sc->cache_busy++;
 					break;
 				case CTE_WRITE_DONE:
+#ifdef SSD_DEBUG
 					DPRINTK("%lu: %s: cte already done",
 						sio->nr, __FUNCTION__);
+#endif
 					break;
 				case CTE_WRITE_ERROR:
 					WPRINTK(sio, "cte target write fail");
