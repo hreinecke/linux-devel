@@ -167,7 +167,6 @@ enum cte_match_t {
 	CTE_WRITE_INVALID,
 	CTE_WRITE_MISS,
 	CTE_WRITE_DONE,
-	CTE_WRITE_ERROR,
 	CTE_LOOKUP_FAILED,
 };
 
@@ -542,10 +541,15 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 		      DEFAULT_BLOCKSIZE);
 	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
+#ifdef SSDCACHE_ASYNC_LOOKUP
 	if (!sio->error) {
 		bitmap_or(newcte->target_busy, oldcte->target_busy,
 			  sio->bio_mask, DEFAULT_BLOCKSIZE);
 	}
+#else
+	bitmap_or(newcte->target_busy, oldcte->target_busy,
+		  sio->bio_mask, DEFAULT_BLOCKSIZE);
+#endif
 	newcte->atime = jiffies;
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
@@ -579,6 +583,7 @@ static void sio_start_writeback(struct ssdcache_io *sio)
 	call_rcu(&oldcte->rcu, cte_reset);
 }
 
+#ifdef SSDCACHE_ASYNC_LOOKUP
 static void sio_start_target_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
@@ -602,6 +607,7 @@ static void sio_start_target_write(struct ssdcache_io *sio)
 	spin_unlock_irq(&sio->cmd->lock);
 	call_rcu(&oldcte->rcu, cte_reset);
 }
+#endif
 
 /*
  * Workqueue handling
@@ -662,7 +668,6 @@ static inline void push_sio(struct list_head *q, struct ssdcache_io *sio)
 {
 	unsigned long flags;
 
-	ssdcache_get_sio(sio);
 	spin_lock_irqsave(&_work_lock, flags);
 	list_add_tail(&sio->list, q);
 	spin_unlock_irqrestore(&_work_lock, flags);
@@ -670,6 +675,7 @@ static inline void push_sio(struct list_head *q, struct ssdcache_io *sio)
 
 static void ssdcache_schedule_sio(struct ssdcache_io *sio)
 {
+	ssdcache_get_sio(sio);
 	push_sio(&_io_work, sio);
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
@@ -800,6 +806,20 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 	dm_io(&iorq, 1, &target, NULL);
 }
 
+static void ssdcache_start_secondary_sio(struct ssdcache_io *sio,
+					 struct bio *bio)
+{
+	struct bio_vec *bvec;
+	int i;
+
+	/* Kick off secondary writes */
+	sio->bio = bio_clone(bio, GFP_NOWAIT);
+	BUG_ON(!sio->bio);
+	bio_for_each_segment(bvec, sio->bio, i)
+		get_page(bvec->bv_page);
+	ssdcache_schedule_sio(sio);
+}
+
 static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 {
 	struct bio_vec *bvec;
@@ -829,8 +849,13 @@ static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
 
 static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
 {
-	bio->bi_bdev = sio->sc->cache_dev->bdev;
-	bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+	if (sio->sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+		bio->bi_bdev = sio->sc->target_dev->bdev;
+	} else {
+		bio->bi_bdev = sio->sc->cache_dev->bdev;
+		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+	}
+	ssdcache_start_secondary_sio(sio, bio);
 }
 
 static bool sio_check_writeback(struct ssdcache_io *sio)
@@ -1016,10 +1041,18 @@ retry:
 		/* Break out if we have found an invalid entry */
 		if (invalid != -1)
 			break;
-		/* Can only eject CLEAN entries */
-		if (!cte_is_clean(cte, sio->bio_mask) ||
-		    cte_target_is_busy(cte, sio->bio_mask) ||
+		/* Can only eject non-busy entries */
+		if (cte_target_is_busy(cte, sio->bio_mask) ||
 		    cte_cache_is_busy(cte, sio->bio_mask)) {
+#ifdef SSD_DEBUG
+			DPRINTK("%lu: %s (cte %lx:%x): skip busy cte",
+				sio->nr, __FUNCTION__, sio->cmd->hash, i);
+#endif
+			busy++;
+			continue;
+		}
+		/* Can only eject CLEAN entries */
+		if (!cte_is_clean(cte, sio->bio_mask)) {
 #ifdef SSD_DEBUG
 			DPRINTK("%lu: %s (cte %lx:%x): skip not-clean cte",
 				sio->nr, __FUNCTION__, sio->cmd->hash, i);
@@ -1118,7 +1151,9 @@ static void process_sio(struct work_struct *ignored)
 	LIST_HEAD(defer);
 	unsigned long flags;
 	struct ssdcache_io *sio, *next;
+#ifdef SSDCACHE_ASYNC_LOOKUP
 	enum cte_match_t ret = CTE_LOOKUP_FAILED;
+#endif
 
 	spin_lock_irqsave(&_work_lock, flags);
 	list_splice_init(&_io_work, &tmp);
@@ -1128,6 +1163,7 @@ static void process_sio(struct work_struct *ignored)
 		if (sio->bio) {
 			/* secondary write */
 			if (sio->sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+#ifdef SSDCACHE_ASYNC_LOOKUP
 				ret = CTE_LOOKUP_FAILED;
 				if (!sio->cmd || sio->cte_idx == -1)
 					ret = cte_match(sio, WRITE);
@@ -1149,18 +1185,21 @@ static void process_sio(struct work_struct *ignored)
 						sio->nr, __FUNCTION__);
 #endif
 					break;
-				case CTE_WRITE_ERROR:
-					WPRINTK(sio, "cte target write fail");
-					break;
 				default:
 					WPRINTK(sio, "cte lookup failed %d",
 						ret);
 					sio->error = -ENOENT;
 					sio->sc->cache_failures++;
 				}
+#else
+				ssdcache_get_sio(sio);
+				write_to_cache(sio, sio->bio);
+#endif
 			} else {
 				ssdcache_get_sio(sio);
+#ifdef SSDCACHE_ASYNC_LOOKUP
 				sio_start_target_write(sio);
+#endif
 				write_to_target(sio, sio->bio);
 			}
 		} else if (sio->writeback_bio) {
@@ -1225,21 +1264,15 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio->bio_sector = cte_bio_align(sc, bio);
 	sio_bio_mask(sio, bio);
 	map_context->ptr = sio;
+#ifdef SSDCACHE_ASYNC_LOOKUP
 	if (bio_data_dir(bio) == WRITE) {
-		struct bio_vec *bvec;
-		int i;
-
-		/* Kick off secondary writes */
-		sio->bio = bio_clone(bio, GFP_NOWAIT);
-		BUG_ON(!sio->bio);
-		bio_for_each_segment(bvec, sio->bio, i)
-			get_page(bvec->bv_page);
-		ssdcache_schedule_sio(sio);
+		ssdcache_start_secondary_sio(sio, bio);
 		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
 	}
+#endif
 	switch (cte_match(sio, bio_data_dir(bio))) {
 	case CTE_READ_CLEAN:
 		/* Cache hit, cte clean */
@@ -1277,9 +1310,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		sio_start_prefetch(sio, bio);
 		break;
 	case CTE_LOOKUP_FAILED:
+#if 0
 		WPRINTK(sio, "lookup failure %llx %u",
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
+#endif
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
@@ -1292,11 +1327,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		bio_endio(bio, sio->error);
 		ssdcache_put_sio(sio);
 		return DM_MAPIO_SUBMITTED;
-		break;
-	case CTE_WRITE_ERROR:
-		WPRINTK(sio, "write target failure");
-		ssdcache_put_sio(sio);
-		return sio->error;
 		break;
 	case CTE_WRITE_BUSY:
 		WPRINTK(sio, "write hit busy %llx %u",
@@ -1362,15 +1392,18 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 		bool to_cache = bio->bi_bdev == sio->sc->cache_dev->bdev;
 		if (!sio_match_sector(sio)) {
 			WPRINTK(sio, "cte overrun, not updating state");
+			sio->sc->cache_overruns++;
 		} else if (to_cache) {
 			if (!sio_cache_is_busy(sio)) {
-				WPRINTK(sio, "cte not busy, not updating");
+				WPRINTK(sio, "cache not busy, not updating");
+				sio->sc->cache_overruns++;
 			} else {
 				sio_update_cte(sio, to_cache);
 			}
 		} else {
 			if (!sio_target_is_busy(sio)) {
-				WPRINTK(sio, "cte not busy, not updating");
+				WPRINTK(sio, "target not busy, not updating");
+				sio->sc->cache_overruns++;
 			} else {
 				sio_update_cte(sio, to_cache);
 			}
