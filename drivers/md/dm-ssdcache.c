@@ -124,7 +124,7 @@ struct ssdcache_io {
 	struct bio *writeback_bio;
 	unsigned long bio_sector;
 	DECLARE_BITMAP(bio_mask, DEFAULT_BLOCKSIZE);
-	unsigned long error;
+	int error;
 };
 
 static DEFINE_SPINLOCK(_work_lock);
@@ -453,10 +453,12 @@ static void sio_cleanup_cte(struct ssdcache_io *sio)
 		is_invalid = true;
 	rcu_read_unlock();
 
+	if (!oldcte)
+		return;
+
 	if (!is_invalid) {
 		newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
-		if (!newcte)
-			return;
+		/* Failure is okay; we'll drop the cte then */
 	} else {
 		WPRINTK(sio, "drop invalid cte");
 		newcte = NULL;
@@ -465,8 +467,7 @@ static void sio_cleanup_cte(struct ssdcache_io *sio)
 	spin_lock_irq(&sio->cmd->lock);
 	if (newcte) {
 		oldcte = sio->cmd->te[sio->cte_idx];
-		if (oldcte)
-			*newcte = *oldcte;
+		*newcte = *oldcte;
 
 		newcte->atime = jiffies;
 		newcte->count++;
@@ -522,26 +523,9 @@ static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
-static void sio_invalidate(struct ssdcache_io *sio)
-{
-	struct ssdcache_te *oldcte;
-
-	BUG_ON(!sio || sio->cte_idx < 0);
-
-	spin_lock_irq(&sio->cmd->lock);
-	oldcte = sio->cmd->te[sio->cte_idx];
-	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], NULL);
-	spin_unlock_irq(&sio->cmd->lock);
-	if (oldcte)
-		call_rcu(&oldcte->rcu, cte_reset);
-}
-
 static void sio_start_cache_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
-
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return;
 
 	/* Check if we should drop the old cte */
 	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
@@ -573,9 +557,6 @@ static void sio_start_writeback(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
 
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return;
-
 	/* Check if we should drop the old cte */
 	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
 	if (!newcte)
@@ -601,9 +582,6 @@ static void sio_start_writeback(struct ssdcache_io *sio)
 static void sio_start_target_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
-
-	if (!sio || !sio->cmd || sio->cte_idx == -1)
-		return;
 
 	/* Check if we should drop the old cte */
 	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
@@ -721,7 +699,7 @@ static void cache_io_callback(unsigned long error, void *context)
 	} else {
 		if (error) {
 			WPRINTK(sio, "finished with %lu", error);
-			sio->error = error;
+			sio->error = -EIO;
 		}
 		if (sio->error == -EUCLEAN) {
 #ifdef SSD_DEBUG
@@ -754,9 +732,9 @@ static void target_io_callback(unsigned long error, void *context)
 	} else if (!sio_target_is_busy(sio)) {
 		WPRINTK(sio, "cte not busy, not updating state");
 	} else {
-		if (error || sio->error) {
+		if (error) {
 			WPRINTK(sio, "finished with %lu", error);
-			sio->error = error;
+			sio->error = -EIO;
 		}
 		sio_update_cte(sio, false);
 	}
@@ -1073,8 +1051,8 @@ retry:
 		hash_number = rotate(sio->sc, hash_number);
 		assoc--;
 #ifdef SSD_DEBUG
-		DPRINTK("%s (cte %lx:ff): retry with assoc %d", __FUNCTION__,
-			sio->cmd->hash, assoc);
+		DPRINTK("%lu: %s (cte %lx:ff): retry with assoc %d",
+			sio->nr, __FUNCTION__, sio->cmd->hash, assoc);
 #endif
 		goto retry;
 	}
@@ -1175,10 +1153,10 @@ static void process_sio(struct work_struct *ignored)
 					WPRINTK(sio, "cte target write fail");
 					break;
 				default:
-					WPRINTK(sio, "invalid cte lookup %d",
+					WPRINTK(sio, "cte lookup failed %d",
 						ret);
 					sio->error = -ENOENT;
-					sio->sc->cache_overruns++;
+					sio->sc->cache_failures++;
 				}
 			} else {
 				ssdcache_get_sio(sio);
@@ -1362,18 +1340,21 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 	if (!sio)
 		return error;
 
-	if (!sio->cmd) {
+	if (!sio->cmd || sio->cte_idx == -1) {
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s: cte lookup not finished",
 			sio->nr, __FUNCTION__);
 #endif
 		sio->sc->cache_overruns++;
-		sio->error = -EUCLEAN;
+		sio->error = error ? error : -EUCLEAN;
 		goto out;
 	}
-	if (error || sio->error) {
+	if (error) {
 		WPRINTK(sio, "finished with %u", error);
 		sio->error = error;
+	}
+	if (sio->error) {
+		WPRINTK(sio, "error %d", sio->error);
 		unmap_writeback_bio(sio);
 	}
 
