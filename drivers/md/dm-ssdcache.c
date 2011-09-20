@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-// #define SSD_DEBUG
+#define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -167,6 +167,7 @@ enum cte_match_t {
 	CTE_WRITE_INVALID,
 	CTE_WRITE_MISS,
 	CTE_WRITE_DONE,
+	CTE_WRITE_SKIP,
 	CTE_LOOKUP_FAILED,
 };
 
@@ -756,6 +757,7 @@ static inline sector_t to_cache_sector(struct ssdcache_io *sio,
 
 	sector_offset = data_sector & sio->sc->block_mask;
 
+	BUG_ON(!sio->cmd);
 	BUG_ON(sio->cte_idx < 0);
 	cte_offset = to_sector(sio->cte_idx) * sio->sc->block_size;
 	cmd_offset = to_sector(sio->cmd->hash * sio->cmd->num_cte) * sio->sc->block_size;
@@ -952,7 +954,7 @@ static enum cte_match_t cte_match(struct ssdcache_io *sio, int rw)
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
-	int invalid, oldest, i, index, busy = 0, assoc = 1;
+	int invalid, oldest, i, index, busy = 0, assoc = 0;
 	enum cte_match_t retval = CTE_LOOKUP_FAILED;
 
 	hash_number = hash_block(sio->sc, sio->bio_sector);
@@ -970,7 +972,7 @@ retry:
 		if (rw == WRITE) {
 			/* Skip cte instantiation on WRITE */
 			sio->cte_idx = -1;
-			return retval;
+			return CTE_WRITE_SKIP;
 		}
 		if (sio->error) {
 			/* Target write already completed */
@@ -1041,17 +1043,25 @@ retry:
 		 * Do not attempt to evict entries when
 		 * target writes have already completed.
 		 */
-		if (sio->error)
+		if (sio->error) {
+			DPRINTK("%lu: %s (cte %lx:%x): error %d",
+				sio->nr, __FUNCTION__, sio->cmd->hash, i,
+				sio->error);
 			continue;
+		}
 		/* Break out if we have found an invalid entry */
 		if (invalid != -1)
 			break;
+		/* Skip cache eviction on WRITE */
+		if (rw == WRITE)
+			continue;
 		/* Can only eject non-busy entries */
 		if (cte_target_is_busy(cte, sio->bio_mask) ||
 		    cte_cache_is_busy(cte, sio->bio_mask)) {
 #ifdef SSD_DEBUG
-			DPRINTK("%lu: %s (cte %lx:%x): skip busy cte",
-				sio->nr, __FUNCTION__, sio->cmd->hash, i);
+			DPRINTK("%lu: %s (cte %lx:%x): skip busy cte %d %p",
+				sio->nr, __FUNCTION__, sio->cmd->hash, i,
+				invalid, cte);
 #endif
 			busy++;
 			continue;
@@ -1065,9 +1075,6 @@ retry:
 			busy++;
 			continue;
 		}
-		/* Skip cache eviction on WRITE */
-		if (rw == WRITE)
-			continue;
 		if (sio->sc->cache_strategy == CACHE_LRU) {
 			/* Select the oldest clean entry */
 			rcu_read_lock();
@@ -1092,8 +1099,8 @@ retry:
 		hash_number = rotate(sio->sc, hash_number);
 		assoc--;
 #ifdef SSD_DEBUG
-		DPRINTK("%lu: %s (cte %lx:ff): retry with assoc %d",
-			sio->nr, __FUNCTION__, sio->cmd->hash, assoc);
+		DPRINTK("%lu: %s (cte %lx:%x): retry with assoc %d",
+			sio->nr, __FUNCTION__, sio->cmd->hash, i, assoc);
 #endif
 		goto retry;
 	}
@@ -1142,6 +1149,9 @@ found:
 	} else if (sio->error) {
 		sio->cte_idx = -1;
 		retval = CTE_WRITE_DONE;
+	} else if (rw == WRITE) {
+		sio->cte_idx = -1;
+		retval = CTE_WRITE_SKIP;
 	} else {
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s (cte %lx:ff): %d ctes busy", sio->nr,
@@ -1318,11 +1328,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		sio_start_prefetch(sio, bio);
 		break;
 	case CTE_LOOKUP_FAILED:
-#if 0
-		WPRINTK(sio, "lookup failure %llx %u",
+		DPRINTK("%lu: %s: lookup failure %llx %u",
+			sio->nr, __FUNCTION__,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
-#endif
+	case CTE_WRITE_SKIP:
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
