@@ -681,6 +681,18 @@ static void ssdcache_schedule_sio(struct ssdcache_io *sio)
 	queue_work(_ssdcached_wq, &_ssdcached_work);
 }
 
+static void map_writeback_bio(struct ssdcache_io *sio, struct bio *bio)
+{
+	struct bio_vec *bvec;
+	int i;
+
+	BUG_ON(sio->writeback_bio);
+	sio->writeback_bio = bio_clone(bio, GFP_NOWAIT);
+	sio->writeback_bio->bi_rw |= WRITE;
+	bio_for_each_segment(bvec, sio->writeback_bio, i)
+		get_page(bvec->bv_page);
+}
+
 static void unmap_writeback_bio(struct ssdcache_io *sio)
 {
 	int i;
@@ -828,10 +840,7 @@ static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 	int i;
 
 	/* Setup clone for writing to cache device */
-	sio->writeback_bio = bio_clone(bio, GFP_NOWAIT);
-	sio->writeback_bio->bi_rw |= WRITE;
-	bio_for_each_segment(bvec, sio->writeback_bio, i)
-		get_page(bvec->bv_page);
+	map_writeback_bio(sio, bio);
 	sio->sc->cache_misses++;
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
@@ -1602,7 +1611,9 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 {
 	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
 	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
+	struct ssdcache_te *cte;
 	unsigned long nr_elems, nr_cmds = 0, nr_ctes = 0, pos = 0;
+	unsigned long nr_cache_busy = 0, nr_target_busy = 0;
 	int i, j;
 
 	rcu_read_lock();
@@ -1615,8 +1626,16 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			pos = cmd->hash;
 			nr_cmds++;
 			for (j = 0; j < cmd->num_cte; j++) {
-				if (cmd->te[j])
+				cte = rcu_dereference(cmd->te[j]);
+				if (cte) {
 					nr_ctes++;
+					if (!bitmap_empty(cte->target_busy,
+							  DEFAULT_BLOCKSIZE))
+						nr_target_busy++;
+					if (!bitmap_empty(cte->cache_busy,
+							  DEFAULT_BLOCKSIZE))
+						nr_cache_busy++;
+				}
 			}
 		}
 		pos++;
@@ -1626,13 +1645,15 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
 			 "cache misses %lu hits %lu busy %lu overruns %lu "
-			 "bypassed %lu evicts %lu failures %lu sio %lu cte %lu",
+			 "bypassed %lu evicts %lu failures %lu sio %lu "
+			 "cte %lu (%%lu/%lu)",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
 			 sc->cache_evictions, sc->cache_failures,
-			 sc->sio_active, sc->cte_active - nr_ctes);
+			 sc->sio_active, sc->cte_active - nr_ctes,
+			 nr_target_busy, nr_cache_busy);
 		break;
 
 	case STATUSTYPE_TABLE:
