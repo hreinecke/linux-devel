@@ -44,8 +44,8 @@
 
 /* Caching modes */
 enum ssdcache_mode_t {
-	CACHE_IS_WRITETHROUGH,
-	CACHE_IS_WRITEBACK,
+	CACHE_MODE_WRITETHROUGH,
+	CACHE_MODE_WRITEBACK,
 };
 
 /* Caching strategies */
@@ -58,10 +58,6 @@ enum ssdcache_algorithm_t {
 	CACHE_ALG_HASH64,
 	CACHE_ALG_WRAP,
 };
-
-static enum ssdcache_mode_t default_cache_mode = CACHE_IS_WRITETHROUGH;
-static enum ssdcache_strategy_t default_cache_strategy = CACHE_LFU;
-static enum ssdcache_algorithm_t default_cache_algorithm = CACHE_ALG_HASH64;
 
 struct ssdcache_md;
 struct ssdcache_io;
@@ -87,6 +83,13 @@ struct ssdcache_md {
 	struct ssdcache_te *te[DEFAULT_ASSOCIATIVITY];	/* RCU Table entries */
 };
 
+struct ssdcache_options {
+	unsigned mode:1;
+	unsigned strategy:1;
+	unsigned async_lookup:1;
+	unsigned cache_on_write:1;
+};
+
 struct ssdcache_ctx {
 	struct dm_dev *target_dev;
 	struct dm_dev *cache_dev;
@@ -101,8 +104,7 @@ struct ssdcache_ctx {
 	unsigned long nr_sio;
 	unsigned long sio_active;
 	unsigned long cte_active;
-	enum ssdcache_mode_t cache_mode;
-	enum ssdcache_strategy_t cache_strategy;
+	struct ssdcache_options options;
 	unsigned long cache_misses;
 	unsigned long cache_hits;
 	unsigned long cache_busy;
@@ -126,6 +128,14 @@ struct ssdcache_io {
 	DECLARE_BITMAP(bio_mask, DEFAULT_BLOCKSIZE);
 	int error;
 };
+
+static enum ssdcache_mode_t default_cache_mode = CACHE_MODE_WRITETHROUGH;
+static enum ssdcache_strategy_t default_cache_strategy = CACHE_LFU;
+static enum ssdcache_algorithm_t default_cache_algorithm = CACHE_ALG_HASH64;
+
+#define CACHE_IS_WRITETHROUGH(sc) \
+	((sc)->options.mode == CACHE_MODE_WRITETHROUGH)
+#define CACHE_USE_LRU(sc) ((sc)->options.strategy == CACHE_LRU)
 
 static DEFINE_SPINLOCK(_work_lock);
 static struct workqueue_struct *_ssdcached_wq;
@@ -542,15 +552,15 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 		      DEFAULT_BLOCKSIZE);
 	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
-#ifdef SSDCACHE_ASYNC_LOOKUP
-	if (!sio->error) {
+	if (sio->sc->options.async_lookup) {
+		if (!sio->error) {
+			bitmap_or(newcte->target_busy, oldcte->target_busy,
+				  sio->bio_mask, DEFAULT_BLOCKSIZE);
+		}
+	} else {
 		bitmap_or(newcte->target_busy, oldcte->target_busy,
 			  sio->bio_mask, DEFAULT_BLOCKSIZE);
 	}
-#else
-	bitmap_or(newcte->target_busy, oldcte->target_busy,
-		  sio->bio_mask, DEFAULT_BLOCKSIZE);
-#endif
 	newcte->atime = jiffies;
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
@@ -584,7 +594,6 @@ static void sio_start_writeback(struct ssdcache_io *sio)
 	call_rcu(&oldcte->rcu, cte_reset);
 }
 
-#ifdef SSDCACHE_ASYNC_LOOKUP
 static void sio_start_target_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
@@ -608,7 +617,6 @@ static void sio_start_target_write(struct ssdcache_io *sio)
 	spin_unlock_irq(&sio->cmd->lock);
 	call_rcu(&oldcte->rcu, cte_reset);
 }
-#endif
 
 /*
  * Workqueue handling
@@ -855,7 +863,7 @@ static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
 
 static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
 {
-	if (sio->sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+	if (CACHE_IS_WRITETHROUGH(sio->sc)) {
 		bio->bi_bdev = sio->sc->target_dev->bdev;
 	} else {
 		bio->bi_bdev = sio->sc->cache_dev->bdev;
@@ -1080,7 +1088,7 @@ retry:
 			busy++;
 			continue;
 		}
-		if (sio->sc->cache_strategy == CACHE_LRU) {
+		if (CACHE_USE_LRU(sio->sc)) {
 			/* Select the oldest clean entry */
 			rcu_read_lock();
 			cte_atime = rcu_dereference(cte)->atime;
@@ -1168,15 +1176,42 @@ out:
 	return retval;
 }
 
+static void sio_lookup_async(struct ssdcache_io *sio)
+{
+	enum cte_match_t ret = CTE_LOOKUP_FAILED;
+
+	if (!sio->cmd || sio->cte_idx == -1)
+		ret = cte_match(sio, WRITE);
+	switch (ret) {
+	case CTE_WRITE_INVALID:
+	case CTE_WRITE_CLEAN:
+	case CTE_WRITE_MISS:
+		ssdcache_get_sio(sio);
+		write_to_cache(sio, sio->bio);
+		break;
+	case CTE_WRITE_BUSY:
+		WPRINTK(sio, "cte busy for write");
+		sio->error = -EBUSY;
+		sio->sc->cache_busy++;
+		break;
+	case CTE_WRITE_DONE:
+#ifdef SSD_DEBUG
+		DPRINTK("%lu: %s: cte already done",
+			sio->nr, __FUNCTION__);
+#endif
+		break;
+	default:
+		WPRINTK(sio, "cte lookup failed %d", ret);
+		sio->error = -ENOENT;
+		sio->sc->cache_failures++;
+	}
+}
 static void process_sio(struct work_struct *ignored)
 {
 	LIST_HEAD(tmp);
 	LIST_HEAD(defer);
 	unsigned long flags;
 	struct ssdcache_io *sio, *next;
-#ifdef SSDCACHE_ASYNC_LOOKUP
-	enum cte_match_t ret = CTE_LOOKUP_FAILED;
-#endif
 
 	spin_lock_irqsave(&_work_lock, flags);
 	list_splice_init(&_io_work, &tmp);
@@ -1185,44 +1220,17 @@ static void process_sio(struct work_struct *ignored)
 		list_del_init(&sio->list);
 		if (sio->bio) {
 			/* secondary write */
-			if (sio->sc->cache_mode == CACHE_IS_WRITETHROUGH) {
-#ifdef SSDCACHE_ASYNC_LOOKUP
-				ret = CTE_LOOKUP_FAILED;
-				if (!sio->cmd || sio->cte_idx == -1)
-					ret = cte_match(sio, WRITE);
-				switch (ret) {
-				case CTE_WRITE_INVALID:
-				case CTE_WRITE_CLEAN:
-				case CTE_WRITE_MISS:
+			if (CACHE_IS_WRITETHROUGH(sio->sc)) {
+				if (sio->sc->options.async_lookup)
+					sio_lookup_async(sio);
+				else {
 					ssdcache_get_sio(sio);
 					write_to_cache(sio, sio->bio);
-					break;
-				case CTE_WRITE_BUSY:
-					WPRINTK(sio, "cte busy for write");
-					sio->error = -EBUSY;
-					sio->sc->cache_busy++;
-					break;
-				case CTE_WRITE_DONE:
-#ifdef SSD_DEBUG
-					DPRINTK("%lu: %s: cte already done",
-						sio->nr, __FUNCTION__);
-#endif
-					break;
-				default:
-					WPRINTK(sio, "cte lookup failed %d",
-						ret);
-					sio->error = -ENOENT;
-					sio->sc->cache_failures++;
 				}
-#else
-				ssdcache_get_sio(sio);
-				write_to_cache(sio, sio->bio);
-#endif
 			} else {
 				ssdcache_get_sio(sio);
-#ifdef SSDCACHE_ASYNC_LOOKUP
-				sio_start_target_write(sio);
-#endif
+				if (sio->sc->options.async_lookup)
+					sio_start_target_write(sio);
 				write_to_target(sio, sio->bio);
 			}
 		} else if (sio->writeback_bio) {
@@ -1287,15 +1295,16 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio->bio_sector = cte_bio_align(sc, bio);
 	sio_bio_mask(sio, bio);
 	map_context->ptr = sio;
-#ifdef SSDCACHE_ASYNC_LOOKUP
-	if (bio_data_dir(bio) == WRITE) {
-		ssdcache_start_secondary_sio(sio, bio);
-		if (sc->cache_mode == CACHE_IS_WRITETHROUGH) {
+	if (sc->options.async_lookup &&
+	    (bio_data_dir(bio) == WRITE)) {
+		map_secondary_bio(sio, bio);
+		ssdcache_schedule_sio(sio);
+		if (CACHE_IS_WRITETHROUGH(sc)) {
 			bio->bi_bdev = sc->target_dev->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
 	}
-#endif
+
 	switch (cte_match(sio, bio_data_dir(bio))) {
 	case CTE_READ_CLEAN:
 		/* Cache hit, cte clean */
@@ -1494,28 +1503,28 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (argc >= 4) {
 		if (!strncmp(argv[3], "lru", 3)) {
-			sc->cache_strategy = CACHE_LRU;
+			sc->options.strategy = CACHE_LRU;
 		} else if (!strncmp(argv[3], "lfu", 3)) {
-			sc->cache_strategy = CACHE_LFU;
+			sc->options.strategy = CACHE_LFU;
 		} else {
 			ti->error = "dm-ssdcache: invalid strategy";
-			sc->cache_strategy = default_cache_strategy;
+			sc->options.strategy = default_cache_strategy;
 		}
 	} else {
-		sc->cache_strategy = default_cache_strategy;
+		sc->options.strategy = default_cache_strategy;
 	}
 
 	if (argc >= 5) {
 		if (!strncmp(argv[4], "wb", 2)) {
-			sc->cache_mode = CACHE_IS_WRITEBACK;
+			sc->options.mode = CACHE_MODE_WRITEBACK;
 		} else if (!strncmp(argv[4], "wt", 2)) {
-			sc->cache_mode = CACHE_IS_WRITETHROUGH;
+			sc->options.mode = CACHE_MODE_WRITETHROUGH;
 		} else {
 			ti->error = "dm-ssdcache: invalid cache mode";
-			sc->cache_mode = default_cache_mode;
+			sc->options.mode = default_cache_mode;
 		}
 	} else {
-		sc->cache_mode = default_cache_mode;
+		sc->options.mode = default_cache_mode;
 	}
 
 	sc->iocp = dm_io_client_create();
@@ -1653,11 +1662,11 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		break;
 
 	case STATUSTYPE_TABLE:
-		snprintf(result, maxlen, "%s %s %lu %s %s",
+		snprintf(result, maxlen, "%s %s %lu options %s %s",
 			 sc->target_dev->name, sc->cache_dev->name,
 			 sc->block_size,
-			 sc->cache_strategy == CACHE_LRU ? "lru" : "lfu",
-			 sc->cache_mode == CACHE_IS_WRITETHROUGH ?
+			 CACHE_USE_LRU(sc) ? "lru" : "lfu",
+			 CACHE_IS_WRITETHROUGH(sc) ?
 			 "wt" : "wb" );
 		break;
 	}
