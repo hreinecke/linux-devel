@@ -19,7 +19,7 @@
 
 #define DM_MSG_PREFIX "ssdcache: "
 
-#define SSD_DEBUG
+// #define SSD_DEBUG
 #define SSD_LOG
 
 #ifdef SSD_LOG
@@ -488,7 +488,7 @@ static void sio_cleanup_cte(struct ssdcache_io *sio)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
-static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
+static void sio_finish_cache_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
 
@@ -510,22 +510,50 @@ static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
 	newcte->atime = jiffies;
 	newcte->count++;
 	/* Reset busy bitmaps */
-	if (is_cache)
-		bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
-			      sio->bio_mask, DEFAULT_BLOCKSIZE);
+	bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
+		      sio->bio_mask, DEFAULT_BLOCKSIZE);
+	/* Update the clean bitmap */
+	if (sio->error)
+		bitmap_andnot(newcte->clean, newcte->clean, sio->bio_mask,
+			      DEFAULT_BLOCKSIZE);
 	else
-		bitmap_andnot(newcte->target_busy, newcte->target_busy,
-			      sio->bio_mask, DEFAULT_BLOCKSIZE);
+		bitmap_or(newcte->clean, newcte->clean, sio->bio_mask,
+			  DEFAULT_BLOCKSIZE);
 
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
+	spin_unlock_irq(&sio->cmd->lock);
+	if (oldcte)
+		call_rcu(&oldcte->rcu, cte_reset);
+}
+
+static void sio_finish_target_write(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *newcte, *oldcte;
+
+	BUG_ON(!sio);
+
+	BUG_ON(!sio->cmd);
+	BUG_ON(sio->cte_idx == -1);
+
+	/* Check if we should drop the old cte */
+	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
+	if (!newcte)
+		return;
+
+	spin_lock_irq(&sio->cmd->lock);
+	oldcte = sio->cmd->te[sio->cte_idx];
+	if (oldcte)
+		*newcte = *oldcte;
+
+	newcte->atime = jiffies;
+	newcte->count++;
+	/* Reset busy bitmaps */
+	bitmap_andnot(newcte->target_busy, newcte->target_busy,
+		      sio->bio_mask, DEFAULT_BLOCKSIZE);
 	/* Upon error always reset the clean bitmap */
 	if (sio->error)
 		bitmap_andnot(newcte->clean, newcte->clean, sio->bio_mask,
 			      DEFAULT_BLOCKSIZE);
-	/* And update the clean bitmap if it was a cache write */
-	else if (is_cache) {
-		bitmap_or(newcte->clean, newcte->clean, sio->bio_mask,
-			  DEFAULT_BLOCKSIZE);
-	}
 
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
@@ -585,6 +613,7 @@ static void sio_start_cache_write(struct ssdcache_io *sio)
 		      DEFAULT_BLOCKSIZE);
 	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
 		   DEFAULT_BLOCKSIZE);
+
 	if (sio->sc->options.async_lookup) {
 		if (!sio->error) {
 			bitmap_or(newcte->target_busy, oldcte->target_busy,
@@ -779,7 +808,7 @@ static void cache_io_callback(unsigned long error, void *context)
 #endif
 			sio->error = 0;
 		}
-		sio_update_cte(sio, true);
+		sio_finish_cache_write(sio);
 	}
 	unmap_writeback_bio(sio);
 
@@ -808,7 +837,7 @@ static void target_io_callback(unsigned long error, void *context)
 			WPRINTK(sio, "finished with %lu", error);
 			sio->error = -EIO;
 		}
-		sio_update_cte(sio, false);
+		sio_finish_target_write(sio);
 	}
 
 	ssdcache_put_sio(sio);
@@ -1000,7 +1029,7 @@ static enum cte_match_t cte_match(struct ssdcache_io *sio, int rw)
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
-	int invalid, oldest, i, index, busy = 0, assoc = 0;
+	int invalid, oldest, i, index, busy = 0, assoc = 1;
 	enum cte_match_t retval = CTE_LOOKUP_FAILED;
 
 	hash_number = hash_block(sio->sc, sio->bio_sector);
@@ -1105,9 +1134,8 @@ retry:
 		if (cte_target_is_busy(cte, sio->bio_mask) ||
 		    cte_cache_is_busy(cte, sio->bio_mask)) {
 #ifdef SSD_DEBUG
-			DPRINTK("%lu: %s (cte %lx:%x): skip busy cte %d %p",
-				sio->nr, __FUNCTION__, sio->cmd->hash, i,
-				invalid, cte);
+			DPRINTK("%lu: %s (cte %lx:%x): skip busy cte",
+				sio->nr, __FUNCTION__, sio->cmd->hash, i);
 #endif
 			busy++;
 			continue;
@@ -1439,14 +1467,14 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 				WPRINTK(sio, "cache not busy, not updating");
 				sio->sc->cache_overruns++;
 			} else {
-				sio_update_cte(sio, to_cache);
+				sio_finish_cache_write(sio);
 			}
 		} else {
 			if (!sio_target_is_busy(sio)) {
 				WPRINTK(sio, "target not busy, not updating");
 				sio->sc->cache_overruns++;
 			} else {
-				sio_update_cte(sio, to_cache);
+				sio_finish_target_write(sio);
 			}
 		}
 	} else if (sio->writeback_bio) {
