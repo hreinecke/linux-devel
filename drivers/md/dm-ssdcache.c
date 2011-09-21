@@ -757,7 +757,7 @@ static void map_secondary_bio(struct ssdcache_io *sio, struct bio *bio)
 	int i;
 
 	/* Kick off secondary writes */
-	sio->bio = bio_clone(bio, GFP_NOWAIT);
+	sio->bio = bio_clone(bio, GFP_NOIO);
 	BUG_ON(!sio->bio);
 	bio_for_each_segment(bvec, sio->bio, i)
 		get_page(bvec->bv_page);
@@ -769,7 +769,11 @@ static void map_writeback_bio(struct ssdcache_io *sio, struct bio *bio)
 	int i;
 
 	BUG_ON(sio->writeback_bio);
-	sio->writeback_bio = bio_clone(bio, GFP_NOWAIT);
+	sio->writeback_bio = bio_clone(bio, GFP_NOIO);
+	if (!sio->writeback_bio) {
+		WPRINTK(sio, "bio_clone failed");
+		return;
+	}
 	sio->writeback_bio->bi_rw |= WRITE;
 	bio_for_each_segment(bvec, sio->writeback_bio, i)
 		get_page(bvec->bv_page);
@@ -1238,7 +1242,10 @@ static void sio_lookup_async(struct ssdcache_io *sio)
 #endif
 		break;
 	default:
-		WPRINTK(sio, "cte lookup failed %d", ret);
+		DPRINTK("%lu: %s (cte %lx:%lx): cte lookup failed %d",
+			sio->nr, __FUNCTION__,
+			sio->cmd ? sio->cmd->hash : 0xffff,
+			sio->cte_idx == -1 ? 0xfff : sio->cte_idx, ret);
 		sio->error = -ENOENT;
 		sio->sc->cache_failures++;
 	}
@@ -1272,7 +1279,7 @@ static void process_sio(struct work_struct *ignored)
 			}
 		} else if (sio->writeback_bio) {
 			if (!sio_check_writeback(sio)) {
-				WPRINTK(sio, "cancel writeback");
+				/* Cancel writeback */
 				unmap_writeback_bio(sio);
 				sio->error = -ENOENT;
 				sio->sc->cache_overruns++;
@@ -1369,6 +1376,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			bio_cur_bytes(bio));
 #endif
 		sio_start_prefetch(sio, bio);
+		if (!sio->writeback_bio) {
+			sc->cache_failures++;
+			map_context->ptr = NULL;
+			ssdcache_put_sio(sio);
+		}
 		break;
 	case CTE_READ_MISS:
 #ifdef SSD_DEBUG
@@ -1377,6 +1389,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			bio_cur_bytes(bio));
 #endif
 		sio_start_prefetch(sio, bio);
+		if (!sio->writeback_bio) {
+			sc->cache_failures++;
+			map_context->ptr = NULL;
+			ssdcache_put_sio(sio);
+		}
 		break;
 	case CTE_LOOKUP_FAILED:
 		DPRINTK("%lu: %s: lookup failure %llx %u",
@@ -1563,7 +1580,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	} else {
 		sc->options.mode = default_cache_mode;
 	}
-
+	sc->options.async_lookup = 0;
 	sc->iocp = dm_io_client_create();
 	if (IS_ERR(sc->iocp)) {
 		r = PTR_ERR(sc->iocp);
