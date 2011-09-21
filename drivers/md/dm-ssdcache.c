@@ -533,6 +533,39 @@ static void sio_update_cte(struct ssdcache_io *sio, bool is_cache)
 		call_rcu(&oldcte->rcu, cte_reset);
 }
 
+static enum cte_match_t sio_new_cache_write(struct ssdcache_io *sio, int rw)
+{
+	struct ssdcache_te *newcte, *oldcte;
+	enum cte_match_t retval;
+
+	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
+	if (!newcte) {
+		/* Ouch */
+		WPRINTK(sio, "oom, drop old cte");
+		sio->cte_idx = -1;
+		retval = CTE_LOOKUP_FAILED;
+	}
+	spin_lock_irq(&sio->cmd->lock);
+	if (newcte) {
+		if (rw == WRITE) {
+			bitmap_or(newcte->cache_busy, newcte->cache_busy,
+				  sio->bio_mask, DEFAULT_BLOCKSIZE);
+			bitmap_or(newcte->target_busy, newcte->target_busy,
+				  sio->bio_mask, DEFAULT_BLOCKSIZE);
+			retval = CTE_WRITE_MISS;
+		} else {
+			retval = CTE_READ_MISS;
+		}
+		newcte->sector = sio->bio_sector;
+	}
+	oldcte = sio->cmd->te[sio->cte_idx];
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
+	spin_unlock_irq(&sio->cmd->lock);
+	if (oldcte)
+		call_rcu(&oldcte->rcu, cte_reset);
+	return retval;
+}
+
 static void sio_start_cache_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
@@ -1132,33 +1165,9 @@ found:
 	}
 
 	if (index != -1) {
-		struct ssdcache_te *oldcte, *newcte;
-
-		newcte = cte_new(sio->sc, sio->cmd, index);
-		if (!newcte) {
-			/* Ouch */
-			sio->cte_idx = -1;
-			DPRINTK("%lu: %s (cte %lx:ff): oom", sio->nr,
-				__FUNCTION__, sio->cmd->hash);
-			return retval;
-		}
-		spin_lock_irq(&sio->cmd->lock);
-		oldcte = sio->cmd->te[index];
 		sio->cte_idx = index;
-		if (rw == WRITE) {
-			bitmap_or(newcte->cache_busy, newcte->cache_busy,
-				  sio->bio_mask, DEFAULT_BLOCKSIZE);
-			bitmap_or(newcte->target_busy, newcte->target_busy,
-				  sio->bio_mask, DEFAULT_BLOCKSIZE);
-			retval = CTE_WRITE_MISS;
-		} else {
-			retval = CTE_READ_MISS;
-		}
-		newcte->sector = sio->bio_sector;
-		rcu_assign_pointer(sio->cmd->te[index], newcte);
-		spin_unlock_irq(&sio->cmd->lock);
-		if (oldcte)
-			call_rcu(&oldcte->rcu, cte_reset);
+		retval = sio_new_cache_write(sio, rw);
+
 	} else if (sio->error) {
 		sio->cte_idx = -1;
 		retval = CTE_WRITE_DONE;
