@@ -853,8 +853,8 @@ static inline sector_t to_cache_sector(struct ssdcache_io *sio,
 
 	BUG_ON(!sio->cmd);
 	BUG_ON(sio->cte_idx < 0);
-	cte_offset = to_sector(sio->cte_idx) * sio->sc->block_size;
-	cmd_offset = to_sector(sio->cmd->hash * sio->cmd->num_cte) * sio->sc->block_size;
+	cte_offset = sio->cte_idx * sio->sc->block_size;
+	cmd_offset = sio->cmd->hash * sio->cmd->num_cte * sio->sc->block_size;
 	cache_sector = sio->sc->data_offset + cmd_offset + cte_offset + sector_offset;
 
 	if (cache_sector > i_size_read(sio->sc->cache_dev->bdev->bd_inode)) {
