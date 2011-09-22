@@ -1248,13 +1248,16 @@ static void sio_lookup_async(struct ssdcache_io *sio)
 		sio->sc->cache_failures++;
 	}
 }
+
 static void process_sio(struct work_struct *ignored)
 {
 	LIST_HEAD(tmp);
 	LIST_HEAD(defer);
 	unsigned long flags;
 	struct ssdcache_io *sio, *next;
+	int empty = 0;
 
+retry:
 	spin_lock_irqsave(&_work_lock, flags);
 	list_splice_init(&_io_work, &tmp);
 	spin_unlock_irqrestore(&_work_lock, flags);
@@ -1294,7 +1297,10 @@ static void process_sio(struct work_struct *ignored)
 	}
 	spin_lock_irqsave(&_work_lock, flags);
 	list_splice(&tmp, &_io_work);
+	empty = list_empty(&_io_work);
 	spin_unlock_irqrestore(&_work_lock, flags);
+	if (!empty)
+		goto retry;
 }
 
 static int ssdcache_map(struct dm_target *ti, struct bio *bio,
