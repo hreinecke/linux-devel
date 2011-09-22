@@ -39,7 +39,7 @@
 #define MIN_CMD_NUM 64
 #define DEFAULT_CTE_NUM 4096
 
-#define DEFAULT_BLOCKSIZE	8
+#define DEFAULT_BLOCKSIZE	256
 #define DEFAULT_ASSOCIATIVITY	64
 
 /* Caching modes */
