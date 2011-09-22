@@ -1435,7 +1435,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 		sio_start_write_busy(sio, bio);
-		if (CACHE_IS_READCACHE(sio->sc)) {
+		if (!sio->writeback_bio) {
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
@@ -1445,7 +1445,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 		sio_start_write_busy(sio, bio);
-		if (CACHE_IS_READCACHE(sio->sc)) {
+		if (!sio->writeback_bio) {
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
