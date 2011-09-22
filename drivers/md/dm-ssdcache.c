@@ -174,6 +174,7 @@ enum cte_match_t {
 	CTE_READ_MISS,
 	CTE_WRITE_CLEAN,
 	CTE_WRITE_BUSY,
+	CTE_WRITE_DELAY,
 	CTE_WRITE_INVALID,
 	CTE_WRITE_MISS,
 	CTE_WRITE_DONE,
@@ -1098,9 +1099,16 @@ retry:
 				} else {
 					retval = CTE_READ_CLEAN;
 				}
-			} else if (cte_target_is_busy(cte, sio->bio_mask) ||
-				   cte_cache_is_busy(cte, sio->bio_mask)) {
-				/* Busy cte */
+			} else if (cte_target_is_busy(cte, sio->bio_mask)) {
+				/* Target busy */
+				if (rw == WRITE) {
+					sio_start_target_write(sio);
+					retval = CTE_WRITE_DELAY;
+				} else {
+					retval = CTE_READ_BUSY;
+				}
+			} else if (cte_cache_is_busy(cte, sio->bio_mask)) {
+				/* Cache busy */
 				if (rw == WRITE) {
 					sio_start_target_write(sio);
 					retval = CTE_WRITE_BUSY;
@@ -1421,7 +1429,15 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		return DM_MAPIO_SUBMITTED;
 		break;
 	case CTE_WRITE_BUSY:
+#ifdef SSD_DEBUG
 		WPRINTK(sio, "write hit busy %llx %u",
+			(unsigned long long)bio->bi_sector,
+			bio_cur_bytes(bio));
+#endif
+		sio_start_write_busy(sio, bio);
+		break;
+	case CTE_WRITE_DELAY:
+		WPRINTK(sio, "write hit delay %llx %u",
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 		sio_start_write_busy(sio, bio);
