@@ -430,19 +430,17 @@ static bool sio_target_is_busy(struct ssdcache_io *sio)
 static bool sio_match_sector(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *cte;
-	sector_t cte_sector;
+	bool match = false;
 
 	if (!sio || !sio->cmd || sio->cte_idx == -1)
 		return false;
 	rcu_read_lock();
 	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
 	if (cte)
-		cte_sector = cte->sector;
-	else
-		cte_sector = sio->bio_sector - 1;
+		match = (sio->bio_sector == cte->sector);
 	rcu_read_unlock();
 
-	return (sio->bio_sector == cte_sector);
+	return match;
 }
 
 static void sio_cleanup_cte(struct ssdcache_io *sio)
