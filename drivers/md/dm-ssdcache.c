@@ -919,8 +919,20 @@ static void sio_start_read_hit(struct ssdcache_io *sio, struct bio *bio)
 	bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
 }
 
-static void sio_start_busy(struct ssdcache_io *sio, struct bio *bio)
+/*
+ * sio_start_write_busy
+ *
+ * That one's a little tricky.
+ * We hit this when a cache write is still in flight.
+ * However, for writethrough it actually only matters
+ * that the _target_ write is completed.
+ * So we can start the target write and defer the cache
+ * write for until after the original cache write completed.
+ */
+static void sio_start_write_busy(struct ssdcache_io *sio, struct bio *bio)
 {
+	/* Setup clone for writing to cache device */
+	map_writeback_bio(sio, bio);
 	sio->sc->cache_busy++;
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
@@ -962,17 +974,6 @@ static bool sio_check_writeback(struct ssdcache_io *sio)
 	/* Check if there is an outstanding cache write */
 	if (cte_cache_is_busy(cte, sio->bio_mask)) {
 		WPRINTK(sio, "cache sector busy");
-		return false;
-	}
-	/* Check if there is an outstanding target write */
-	/*
-	 * Danger Will Robinson
-	 * There is no guarantee that two writes to the same
-	 * block are handled separate.
-	 * Need to check the block layer details here.
-	 */
-	if (cte_target_is_busy(cte, sio->bio_mask)) {
-		WPRINTK(sio, "target sector busy");
 		return false;
 	}
 
@@ -1101,6 +1102,7 @@ retry:
 				   cte_cache_is_busy(cte, sio->bio_mask)) {
 				/* Busy cte */
 				if (rw == WRITE) {
+					sio_start_target_write(sio);
 					retval = CTE_WRITE_BUSY;
 				} else {
 					retval = CTE_READ_BUSY;
@@ -1368,7 +1370,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 		/* Do not start prefetching here, sector is already busy */
-		sc->cache_busy++;
+		sc->cache_hits++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
 		ssdcache_put_sio(sio);
@@ -1422,7 +1424,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		WPRINTK(sio, "write hit busy %llx %u",
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
-		sio_start_busy(sio, bio);
+		sio_start_write_busy(sio, bio);
 		break;
 	case CTE_WRITE_INVALID:
 #ifdef SSD_DEBUG
@@ -1498,7 +1500,8 @@ static int ssdcache_endio(struct dm_target *ti, struct bio *bio,
 				sio_finish_target_write(sio);
 			}
 		}
-	} else if (sio->writeback_bio) {
+	}
+	if (sio->writeback_bio) {
 		/* Kick off writeback */
 		ssdcache_schedule_sio(sio);
 	}
