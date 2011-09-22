@@ -161,16 +161,6 @@ enum cmd_state {
 	CMD_STATE_RESERVED,
 };
 
-/* Cache table entry states */
-enum cte_state {
-	/* Permanent states */
-	CTE_INVALID,	/* Sector not valid */
-	CTE_CLEAN,	/* Sector valid, Cache and target date identical */
-	/* Transient states */
-	CTE_PREFETCH,	/* Sector valid, Read target data */
-	CTE_UPDATE,	/* Sector valid, Write cache data */
-};
-
 enum cte_match_t {
 	CTE_READ_CLEAN,
 	CTE_READ_BUSY,
@@ -306,33 +296,6 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_ctx *sc,
 
 	radix_tree_preload_end();
 	return cmd;
-}
-
-/*
- * Macros for accessing table entry data
- */
-static const struct {
-	enum cte_state value;
-	char *name;
-} cte_state_string[] = {
-	{ CTE_INVALID, "CTE_INVALID"},
-	{ CTE_CLEAN, "CTE_CLEAN" },
-	{ CTE_PREFETCH, "CTE_PREFETCH" },
-	{ CTE_UPDATE, "CTE_UPDATE" },
-};
-
-const char *cte_state_name(enum cte_state state)
-{
-	int i;
-	char *name = NULL;
-
-	for (i = 0; i < ARRAY_SIZE(cte_state_string); i++) {
-		if (cte_state_string[i].value == state) {
-			name = cte_state_string[i].name;
-			break;
-		}
-	}
-	return name;
 }
 
 #define cte_bio_align(s,b) ((b)->bi_sector & ~(s)->block_mask)
