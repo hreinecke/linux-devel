@@ -88,6 +88,7 @@ struct ssdcache_options {
 	unsigned mode:2;
 	unsigned strategy:1;
 	unsigned async_lookup:1;
+	unsigned enable_writeback:1;
 };
 
 struct ssdcache_ctx {
@@ -898,8 +899,10 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 {
-	/* Setup clone for writing to cache device */
-	map_writeback_bio(sio, bio);
+	if (sio->sc->options.enable_writeback) {
+		/* Setup clone for writing to cache device */
+		map_writeback_bio(sio, bio);
+	}
 	sio->sc->cache_misses++;
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
@@ -1392,7 +1395,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		sio_start_prefetch(sio, bio);
 		if (!sio->writeback_bio) {
-			sc->cache_failures++;
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
@@ -1405,7 +1407,6 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		sio_start_prefetch(sio, bio);
 		if (!sio->writeback_bio) {
-			sc->cache_failures++;
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
@@ -1615,6 +1616,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		sc->options.mode = default_cache_mode;
 	}
 	sc->options.async_lookup = 0;
+	sc->options.enable_writeback = 1;
 	sc->iocp = dm_io_client_create();
 	if (IS_ERR(sc->iocp)) {
 		r = PTR_ERR(sc->iocp);
