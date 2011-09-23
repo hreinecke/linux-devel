@@ -133,7 +133,7 @@ struct ssdcache_io {
 
 static enum ssdcache_mode_t default_cache_mode = CACHE_MODE_WRITETHROUGH;
 static enum ssdcache_strategy_t default_cache_strategy = CACHE_LFU;
-static enum ssdcache_algorithm_t default_cache_algorithm = CACHE_ALG_HASH64;
+static enum ssdcache_algorithm_t default_cache_algorithm = CACHE_ALG_WRAP;
 
 #define CACHE_IS_WRITETHROUGH(sc) \
 	((sc)->options.mode == CACHE_MODE_WRITETHROUGH)
@@ -954,7 +954,6 @@ static void sio_start_write_busy(struct ssdcache_io *sio, struct bio *bio)
 	if (!CACHE_IS_READCACHE(sio->sc))
 		/* Setup clone for writing to cache device */
 		map_writeback_bio(sio, bio);
-	sio->sc->cache_busy++;
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
 
@@ -1524,9 +1523,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		return DM_MAPIO_SUBMITTED;
 		break;
 	case CTE_WRITE_BUSY:
+#ifdef SSD_DEBUG
 		WPRINTK(sio, "write hit busy %llx %u",
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
+#endif
 		sio_start_write_busy(sio, bio);
 		if (!sio->writeback_bio) {
 			map_context->ptr = NULL;
@@ -1537,6 +1538,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		WPRINTK(sio, "write hit cancel %llx %u",
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
+		sio->sc->cache_busy++;
 		map_context->ptr = NULL;
 		ssdcache_put_sio(sio);
 		break;
