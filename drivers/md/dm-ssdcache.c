@@ -113,6 +113,7 @@ struct ssdcache_ctx {
 	unsigned long cache_overruns;
 	unsigned long cache_evictions;
 	unsigned long cache_failures;
+	unsigned long writeback_cancelled;
 };
 
 struct ssdcache_io {
@@ -706,7 +707,8 @@ static void ssdcache_destroy_sio(struct kref *kref)
 		bio_put(sio->bio);
 		sio->bio = NULL;
 	}
-	if (sio_match_sector(sio) &&
+	if (sio->error != -ESTALE &&
+	    sio_match_sector(sio) &&
 	    !sio_cache_is_busy(sio) &&
 	    !sio_target_is_busy(sio))
 		sio_cleanup_cte(sio);
@@ -947,6 +949,20 @@ static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
 	}
 }
 
+/*
+ * sio_check_writeback
+ *
+ * Check if the pending writeback bio is safe for
+ * submission.
+ * At this point the target read has completed
+ * and we try to writeback the original bio to
+ * the cache to increase the likelyhood of a
+ * cache hit.
+ * However, this is an optimisation. So whenever
+ * the cte has been evicted or a write is already
+ * outstanding on the same cte we can safely
+ * cancel the writeback.
+ */
 static bool sio_check_writeback(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *cte;
@@ -959,19 +975,25 @@ static bool sio_check_writeback(struct ssdcache_io *sio)
 	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
 	rcu_read_unlock();
 	if (!cte) {
+#ifdef SSD_DEBUG
 		WPRINTK(sio, "invalid cte");
+#endif
 		return false;
 	}
 	if (cte->sector != sio->bio_sector) {
+#ifdef SSD_DEBUG
 		WPRINTK(sio, "wrong sector %llx %llx",
 			(unsigned long long)cte->sector,
 			(unsigned long long)sio->bio_sector);
+#endif
 		return false;
 	}
 
 	/* Check if there is an outstanding cache write */
 	if (cte_cache_is_busy(cte, sio->bio_mask)) {
+#ifdef SSD_DEBUG
 		WPRINTK(sio, "cache sector busy");
+#endif
 		return false;
 	}
 
@@ -1295,8 +1317,8 @@ retry:
 			if (!sio_check_writeback(sio)) {
 				/* Cancel writeback */
 				unmap_writeback_bio(sio);
-				sio->error = -ENOENT;
-				sio->sc->cache_overruns++;
+				sio->error = -ESTALE;
+				sio->sc->writeback_cancelled++;
 			} else {
 				/* Start writing to cache device */
 				ssdcache_get_sio(sio);
@@ -1739,13 +1761,14 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
 			 "cache misses %lu hits %lu busy %lu overruns %lu "
-			 "bypassed %lu evicts %lu failures %lu sio %lu "
-			 "cte %lu (%lu/%lu)",
+			 "bypassed %lu evicts %lu failures %lu cancelled %lu "
+			 "sio %lu cte %lu (%lu/%lu)",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
 			 sc->cache_evictions, sc->cache_failures,
+			 sc->writeback_cancelled,
 			 sc->sio_active, sc->cte_active - nr_ctes,
 			 nr_target_busy, nr_cache_busy);
 		break;
