@@ -468,27 +468,26 @@ static void sio_finish_cache_write(struct ssdcache_io *sio)
 
 	/* Check if we should drop the old cte */
 	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
-	if (!newcte)
-		return;
 
 	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
-	if (oldcte)
-		*newcte = *oldcte;
+	if (newcte) {
+		if (oldcte)
+			*newcte = *oldcte;
 
-	newcte->atime = jiffies;
-	newcte->count++;
-	/* Reset busy bitmaps */
-	bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
-		      sio->bio_mask, DEFAULT_BLOCKSIZE);
-	/* Update the clean bitmap */
-	if (sio->error)
-		bitmap_andnot(newcte->clean, newcte->clean, sio->bio_mask,
-			      DEFAULT_BLOCKSIZE);
-	else
-		bitmap_or(newcte->clean, newcte->clean, sio->bio_mask,
-			  DEFAULT_BLOCKSIZE);
-
+		newcte->atime = jiffies;
+		newcte->count++;
+		/* Reset busy bitmaps */
+		bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
+			      sio->bio_mask, DEFAULT_BLOCKSIZE);
+		/* Update the clean bitmap */
+		if (sio->error)
+			bitmap_andnot(newcte->clean, newcte->clean,
+				      sio->bio_mask, DEFAULT_BLOCKSIZE);
+		else
+			bitmap_or(newcte->clean, newcte->clean, sio->bio_mask,
+				  DEFAULT_BLOCKSIZE);
+	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
 	if (oldcte)
@@ -506,27 +505,27 @@ static void sio_finish_target_write(struct ssdcache_io *sio)
 
 	/* Check if we should drop the old cte */
 	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
-	if (!newcte)
-		return;
 
 	spin_lock_irq(&sio->cmd->lock);
 	oldcte = sio->cmd->te[sio->cte_idx];
-	if (oldcte)
-		*newcte = *oldcte;
+	if (newcte) {
+		if (oldcte)
+			*newcte = *oldcte;
 
-	newcte->atime = jiffies;
-	newcte->count++;
-	/* Reset busy bitmaps */
-	if (CACHE_IS_READCACHE(sio->sc)) {
-		bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
-			      sio->bio_mask, DEFAULT_BLOCKSIZE);
-	} else {
-		bitmap_andnot(newcte->target_busy, newcte->target_busy,
-			      sio->bio_mask, DEFAULT_BLOCKSIZE);
-		/* Upon error reset the clean bitmap */
-		if (sio->error)
-			bitmap_andnot(newcte->clean, newcte->clean,
+		newcte->atime = jiffies;
+		newcte->count++;
+		/* Reset busy bitmaps */
+		if (CACHE_IS_READCACHE(sio->sc)) {
+			bitmap_andnot(newcte->cache_busy, newcte->cache_busy,
 				      sio->bio_mask, DEFAULT_BLOCKSIZE);
+		} else {
+			bitmap_andnot(newcte->target_busy, newcte->target_busy,
+				      sio->bio_mask, DEFAULT_BLOCKSIZE);
+			/* Upon error reset the clean bitmap */
+			if (sio->error)
+				bitmap_andnot(newcte->clean, newcte->clean,
+					      sio->bio_mask, DEFAULT_BLOCKSIZE);
+		}
 	}
 	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
 	spin_unlock_irq(&sio->cmd->lock);
