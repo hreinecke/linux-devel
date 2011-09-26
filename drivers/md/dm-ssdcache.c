@@ -89,6 +89,7 @@ struct ssdcache_options {
 	unsigned strategy:1;
 	unsigned async_lookup:1;
 	unsigned enable_writeback:1;
+	unsigned queue_busy:1;
 };
 
 struct ssdcache_ctx {
@@ -673,6 +674,8 @@ static void sio_cancel_target_write(struct ssdcache_io *sio)
 	*newcte = *oldcte;
 
 	newcte->count++;
+	bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
+		      DEFAULT_BLOCKSIZE);
 	bitmap_andnot(newcte->target_busy, oldcte->target_busy,
 		      sio->bio_mask, DEFAULT_BLOCKSIZE);
 	newcte->atime = jiffies;
@@ -1199,11 +1202,16 @@ retry:
 			} else if (cte_cache_is_busy(cte, sio->bio_mask)) {
 				/* Cache busy */
 				if (rw == WRITE) {
-					if (CACHE_IS_READCACHE(sio->sc))
+					if (CACHE_IS_READCACHE(sio->sc)) {
 						sio_cte_invalidate(sio);
-					else
+						retval = CTE_WRITE_CANCEL;
+					} else if (sio->sc->options.queue_busy) {
 						sio_start_target_write(sio);
-					retval = CTE_WRITE_BUSY;
+						retval = CTE_WRITE_BUSY;
+					} else {
+						sio_cancel_target_write(sio);
+						retval = CTE_WRITE_CANCEL;
+					}
 				} else {
 					retval = CTE_READ_BUSY;
 				}
@@ -1533,7 +1541,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			bio_cur_bytes(bio));
 #endif
 		sio_start_write_busy(sio, bio);
-		if (!sio->writeback_bio) {
+		if (sc->options.queue_busy && !sio->writeback_bio) {
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
