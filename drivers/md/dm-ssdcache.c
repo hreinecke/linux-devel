@@ -1487,6 +1487,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		sio_start_prefetch(sio, bio);
 		if (!sio->writeback_bio) {
+			if (sc->options.enable_writeback)
+				sc->cache_failures++;
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
@@ -1499,6 +1501,8 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		sio_start_prefetch(sio, bio);
 		if (!sio->writeback_bio) {
+			if (sc->options.enable_writeback)
+				sc->cache_failures++;
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
 		}
