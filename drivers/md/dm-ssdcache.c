@@ -40,7 +40,7 @@
 #define DEFAULT_CTE_NUM 4096
 
 #define DEFAULT_BLOCKSIZE	256
-#define DEFAULT_ASSOCIATIVITY	64
+#define DEFAULT_ASSOCIATIVITY	16
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -1122,7 +1122,7 @@ static enum cte_match_t cte_match(struct ssdcache_io *sio, int rw)
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
-	int invalid, oldest, i, index, busy = 0, assoc = 1;
+	int invalid, oldest, i, index, busy = 0, assoc = 3;
 	enum cte_match_t retval = CTE_LOOKUP_FAILED;
 
 	hash_number = hash_block(sio->sc, sio->bio_sector);
