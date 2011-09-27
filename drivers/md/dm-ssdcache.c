@@ -85,10 +85,11 @@ struct ssdcache_md {
 };
 
 struct ssdcache_options {
-	unsigned mode:2;
-	unsigned strategy:1;
+	enum ssdcache_mode_t mode;
+	enum ssdcache_strategy_t strategy;
+	enum ssdcache_algorithm_t algorithm;
 	unsigned async_lookup:1;
-	unsigned enable_writeback:1;
+	unsigned disable_writeback:1;
 	unsigned queue_busy:1;
 };
 
@@ -927,7 +928,7 @@ static void write_to_target(struct ssdcache_io *sio, struct bio *bio)
 
 static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 {
-	if (sio->sc->options.enable_writeback) {
+	if (!sio->sc->options.disable_writeback) {
 		/* Setup clone for writing to cache device */
 		map_writeback_bio(sio, bio);
 	}
@@ -1099,7 +1100,7 @@ static unsigned long ssdcache_hash_wrap(struct ssdcache_ctx *sc, sector_t sector
 
 static unsigned long hash_block(struct ssdcache_ctx *sc, sector_t sector)
 {
-	if (default_cache_algorithm == CACHE_ALG_HASH64)
+	if (sc->options.algorithm == CACHE_ALG_HASH64)
 		return ssdcache_hash_64(sc, sector);
 	else
 		return ssdcache_hash_wrap(sc, sector);
@@ -1495,7 +1496,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		sio_start_prefetch(sio, bio);
 		if (!sio->writeback_bio) {
-			if (sc->options.enable_writeback)
+			if (!sc->options.disable_writeback)
 				sc->cache_failures++;
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
@@ -1509,7 +1510,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 #endif
 		sio_start_prefetch(sio, bio);
 		if (!sio->writeback_bio) {
-			if (sc->options.enable_writeback)
+			if (!sc->options.disable_writeback)
 				sc->cache_failures++;
 			map_context->ptr = NULL;
 			ssdcache_put_sio(sio);
@@ -1643,6 +1644,119 @@ out:
 	return error;
 }
 
+static int ssdcache_parse_options(struct dm_target *ti,
+				  struct dm_arg_set *as,
+				  struct ssdcache_ctx *sc)
+{
+	int r;
+	unsigned int argc;
+	const char *opt_name;
+	static struct dm_arg _args[] = {
+		{0, 5, "invalid number of options"},
+	};
+
+	r = dm_read_arg_group(_args, as, &argc, &ti->error);
+	if (r)
+		return -EINVAL;
+
+	if (!argc)
+		return 0;
+
+	do {
+		opt_name = dm_shift_arg(as);
+		argc--;
+
+		if (!strcasecmp(opt_name, "lfu")) {
+			sc->options.strategy = CACHE_LFU;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "lru")) {
+			sc->options.strategy = CACHE_LRU;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "writeback")) {
+			sc->options.mode = CACHE_MODE_WRITEBACK;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "writethrough")) {
+			sc->options.mode = CACHE_MODE_WRITETHROUGH;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "readcache")) {
+			sc->options.mode = CACHE_MODE_READCACHE;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "async_lookup")) {
+			sc->options.async_lookup = 1;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "queue_busy")) {
+			sc->options.queue_busy = 1;
+			continue;
+		}
+		if (!strcasecmp(opt_name, "disable_writeback")) {
+			sc->options.disable_writeback = 1;
+			continue;
+		}
+	} while (argc);
+
+	return 0;
+}
+
+void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
+{
+	int optnum = 0;
+
+	if (sc->options.strategy != default_cache_strategy)
+		optnum++;
+
+	if (sc->options.mode != default_cache_mode)
+		optnum++;
+
+	if (sc->options.algorithm != default_cache_algorithm)
+		optnum++;
+
+	if (sc->options.async_lookup)
+		optnum++;
+
+	if (sc->options.disable_writeback)
+		optnum++;
+
+	if (sc->options.queue_busy)
+		optnum++;
+
+	sprintf(optstr,"%d ", optnum);
+	if (sc->options.mode != default_cache_mode) {
+		if (sc->options.mode == CACHE_MODE_WRITEBACK)
+			strcat(optstr, "writeback ");
+		else if (sc->options.mode == CACHE_MODE_READCACHE)
+			strcat(optstr, "readcache ");
+		else
+			strcat(optstr, "writethrough ");
+	}
+	if (sc->options.strategy != default_cache_strategy) {
+		if (sc->options.strategy == CACHE_LFU)
+			strcat(optstr, "lfu ");
+		else
+			strcat(optstr, "lru ");
+	}
+	if (sc->options.algorithm != default_cache_algorithm) {
+		if (sc->options.algorithm == CACHE_ALG_HASH64)
+			strcat(optstr, "hash ");
+		else
+			strcat(optstr, "wrap ");
+	}
+
+	if (sc->options.async_lookup)
+		strcat(optstr, "async_lookup ");
+
+	if (sc->options.queue_busy)
+		strcat(optstr, "queue_busy ");
+
+	if (sc->options.disable_writeback)
+		strcat(optstr, "disable_writeback ");
+	optstr[strlen(optstr)] = '\0';
+}
 
 /*
  * Construct a ssdcache mapping: <target_dev_path> <cache_dev_path>
@@ -1650,15 +1764,15 @@ out:
 static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct ssdcache_ctx *sc;
+	struct dm_arg_set as;
+	const char *devname;
 	unsigned long num_cte;
 	unsigned long cdev_size;
 	unsigned long long tdev_size;
 	int r = 0;
 
-	if (argc < 2 || argc > 6) {
-		ti->error = "Invalid argument count";
-		return -EINVAL;
-	}
+	as.argc = argc;
+	as.argv = argv;
 
 	sc = kzalloc(sizeof(*sc), GFP_KERNEL);
 	if (sc == NULL) {
@@ -1666,14 +1780,26 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
-	if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
+	devname = dm_shift_arg(&as);
+	if (!devname) {
+		ti->error = "dm-ssdcache: Target device is not specified";
+		r = -EINVAL;
+		goto bad;
+	}
+	if (dm_get_device(ti, devname, dm_table_get_mode(ti->table),
 			  &sc->target_dev)) {
 		ti->error = "dm-ssdcache: Target device lookup failed";
 		r = -EINVAL;
 		goto bad;
 	}
 
-	if (dm_get_device(ti, argv[1], dm_table_get_mode(ti->table),
+	devname = dm_shift_arg(&as);
+	if (!devname) {
+		ti->error = "dm-ssdcache: Cache device is not specified";
+		r = -EINVAL;
+		goto bad;
+	}
+	if (dm_get_device(ti, devname, dm_table_get_mode(ti->table),
 			  &sc->cache_dev)) {
 		ti->error = "dm-ssdcache: Cache device lookup failed";
 		dm_put_device(ti, sc->target_dev);
@@ -1681,46 +1807,24 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-	if (argc >= 3) {
-		if (sscanf(argv[2], "%lu", &sc->block_size) != 1) {
+	sc->block_size = DEFAULT_BLOCKSIZE;
+	sc->options.strategy = default_cache_strategy;
+	sc->options.mode = default_cache_mode;
+	sc->options.algorithm = default_cache_algorithm;
+
+	if (as.argc > 0) {
+		if (sscanf(dm_shift_arg(&as), "%lu", &sc->block_size) != 1) {
 			ti->error = "dm-ssdcache: Invalid blocksize";
-			sc->block_size = DEFAULT_BLOCKSIZE;
 		}
 		if (sc->block_size < 1) {
 			ti->error = "dm-ssdcache: blocksize too small";
 			sc->block_size = DEFAULT_BLOCKSIZE;
 		}
-	} else {
-		sc->block_size = DEFAULT_BLOCKSIZE;
+
+		if (ssdcache_parse_options(ti, &as, sc))
+			goto bad_io_client;
 	}
 
-	if (argc >= 4) {
-		if (!strncmp(argv[3], "lru", 3)) {
-			sc->options.strategy = CACHE_LRU;
-		} else if (!strncmp(argv[3], "lfu", 3)) {
-			sc->options.strategy = CACHE_LFU;
-		} else {
-			ti->error = "dm-ssdcache: invalid strategy";
-			sc->options.strategy = default_cache_strategy;
-		}
-	} else {
-		sc->options.strategy = default_cache_strategy;
-	}
-
-	if (argc >= 5) {
-		if (!strncmp(argv[4], "wb", 2)) {
-			sc->options.mode = CACHE_MODE_WRITEBACK;
-		} else if (!strncmp(argv[4], "wt", 2)) {
-			sc->options.mode = CACHE_MODE_WRITETHROUGH;
-		} else {
-			ti->error = "dm-ssdcache: invalid cache mode";
-			sc->options.mode = default_cache_mode;
-		}
-	} else {
-		sc->options.mode = default_cache_mode;
-	}
-	sc->options.async_lookup = 0;
-	sc->options.enable_writeback = 1;
 	sc->iocp = dm_io_client_create();
 	if (IS_ERR(sc->iocp)) {
 		r = PTR_ERR(sc->iocp);
@@ -1811,6 +1915,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
 	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
 	struct ssdcache_te *cte;
+	char optstr[512];
 	unsigned long nr_elems, nr_cmds = 0, nr_ctes = 0, pos = 0;
 	unsigned long nr_cache_busy = 0, nr_target_busy = 0;
 	int i, j;
@@ -1857,13 +1962,10 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		break;
 
 	case STATUSTYPE_TABLE:
-		snprintf(result, maxlen, "%s %s %lu options %s %s",
+		ssdcache_format_options(sc, optstr);
+		snprintf(result, maxlen, "%s %s %lu %s",
 			 sc->target_dev->name, sc->cache_dev->name,
-			 sc->block_size,
-			 CACHE_USE_LRU(sc) ? "lru" : "lfu",
-			 CACHE_IS_READCACHE(sc) ? "rc" :
-			 CACHE_IS_WRITETHROUGH(sc) ?
-			 "wt" : "wb" );
+			 sc->block_size, optstr);
 		break;
 	}
 	return 0;
@@ -1874,6 +1976,8 @@ static int ssdcache_iterate_devices(struct dm_target *ti,
 {
 	struct ssdcache_ctx *sc = ti->private;
 
+	if (!sc)
+		return 0;
 	return fn(ti, sc->target_dev, 0, ti->len, data);
 }
 
