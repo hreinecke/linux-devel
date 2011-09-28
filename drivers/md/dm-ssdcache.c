@@ -858,7 +858,12 @@ static void target_io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	if (!sio->cmd) {
+	if (sio->bio->bi_rw & REQ_FLUSH) {
+		DPRINTK("%lu: %s: data flush done", sio->nr, __FUNCTION__);
+		bio_endio(sio->bio, 0);
+		bio_put(sio->bio);
+		sio->bio = NULL;
+	} else if (!sio->cmd) {
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s: cte lookup not finished",
 			sio->nr, __FUNCTION__);
@@ -1355,7 +1360,18 @@ retry:
 		list_del_init(&sio->list);
 		if (sio->bio) {
 			/* secondary write */
-			if (!sio_match_sector(sio)) {
+			if (sio->bio->bi_rw & REQ_FLUSH) {
+				if (bio_cur_bytes(sio->bio)) {
+					ssdcache_get_sio(sio);
+					write_to_target(sio, sio->bio);
+				} else {
+					DPRINTK("%lu: %s: nodata flush done",
+						sio->nr, __FUNCTION__);
+					bio_endio(sio->bio, 0);
+					bio_put(sio->bio);
+					sio->bio = NULL;
+				}
+			} else if (!sio_match_sector(sio)) {
 				WPRINTK(sio, "target cte overrun");
 				sio->error = -ESTALE;
 				sio->sc->cache_overruns++;
@@ -1415,10 +1431,11 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	struct ssdcache_ctx *sc = ti->private;
 	struct ssdcache_io *sio;
 
-	if (bio->bi_rw & REQ_FLUSH) {
+	/* We don't support DISCARD or SECURE_DISCARD (yet) */
+	if (bio->bi_rw & (REQ_DISCARD | REQ_SECURE)) {
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
-		return DM_MAPIO_REMAPPED;
+		return -EOPNOTSUPP;
 	}
 
 	if (bio_cur_bytes(bio) > to_bytes(sc->block_size)) {
@@ -1430,8 +1447,9 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 		return DM_MAPIO_REMAPPED;
 	}
 
-	if (bio_cur_bytes(bio) == 0) {
-		DPRINTK("zero-sized bio (flags %lx)", bio->bi_flags);
+	if (bio_cur_bytes(bio) == 0  &&
+	    !(bio->bi_rw & REQ_FLUSH)) {
+		DPRINTK("zero-sized bio (bi_rw %lx)", bio->bi_rw);
 		sc->cache_bypassed++;
 		bio->bi_bdev = sc->target_dev->bdev;
 		map_context->ptr = NULL;
@@ -1449,6 +1467,14 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio->bio_sector = cte_bio_align(sc, bio);
 	sio_bio_mask(sio, bio);
 	map_context->ptr = sio;
+	if (bio->bi_rw & REQ_FLUSH) {
+		DPRINTK("%lu: %s: flush start", sio->nr, __FUNCTION__);
+		sio->bio = bio;
+		bio_get(bio);
+		map_context->ptr = NULL;
+		ssdcache_schedule_sio(sio);
+		return DM_MAPIO_SUBMITTED;
+	}
 	if (sc->options.async_lookup &&
 	    (bio_data_dir(bio) == WRITE)) {
 		map_secondary_bio(sio, bio);
