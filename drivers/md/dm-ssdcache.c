@@ -1757,6 +1757,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	struct ssdcache_ctx *sc;
 	struct dm_arg_set as;
 	const char *devname;
+	const char *argname;
 	unsigned long num_cmd;
 	unsigned long cdev_size;
 	unsigned long long tdev_size;
@@ -1804,16 +1805,21 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->options.algorithm = default_cache_algorithm;
 
 	if (as.argc > 0) {
-		if (sscanf(dm_shift_arg(&as), "%lu", &sc->block_size) != 1) {
-			ti->error = "dm-ssdcache: Invalid blocksize";
+		argname = dm_shift_arg(&as);
+		if (!strcasecmp(argname, "blocksize")) {
+			if (sscanf(dm_shift_arg(&as), "%lu", &sc->block_size) != 1) {
+				ti->error = "dm-ssdcache: Invalid blocksize";
+			}
+			if (sc->block_size < 1) {
+				ti->error = "dm-ssdcache: blocksize too small";
+				sc->block_size = DEFAULT_BLOCKSIZE;
+			}
+			argname = dm_shift_arg(&as);
 		}
-		if (sc->block_size < 1) {
-			ti->error = "dm-ssdcache: blocksize too small";
-			sc->block_size = DEFAULT_BLOCKSIZE;
+		if (!strcasecmp(argname, "options")) {
+			if (ssdcache_parse_options(ti, &as, sc))
+				goto bad_io_client;
 		}
-
-		if (ssdcache_parse_options(ti, &as, sc))
-			goto bad_io_client;
 	}
 
 	sc->iocp = dm_io_client_create();
@@ -1954,7 +1960,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 
 	case STATUSTYPE_TABLE:
 		ssdcache_format_options(sc, optstr);
-		snprintf(result, maxlen, "%s %s %lu %s",
+		snprintf(result, maxlen, "%s %s blocksize %lu options %s",
 			 sc->target_dev->name, sc->cache_dev->name,
 			 sc->block_size, optstr);
 		break;
