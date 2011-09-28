@@ -1944,18 +1944,15 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	rcu_read_unlock();
 	switch (type) {
 	case STATUSTYPE_INFO:
-		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu "
-			 "cache misses %lu hits %lu busy %lu overruns %lu "
-			 "bypassed %lu evicts %lu failures %lu cancelled %lu "
-			 "sio %lu cte %lu (%lu/%lu)",
+		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu\n"
+			 "\tmisses %lu hits %lu busy %lu overruns %lu\n"
+			 "\tbypassed %lu evicts %lu failures %lu cancelled %lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
 			 sc->cache_evictions, sc->cache_failures,
-			 sc->writeback_cancelled,
-			 sc->sio_active, sc->cte_active - nr_ctes,
-			 nr_target_busy, nr_cache_busy);
+			 sc->writeback_cancelled);
 		break;
 
 	case STATUSTYPE_TABLE:
