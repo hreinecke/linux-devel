@@ -1157,14 +1157,9 @@ retry:
 		}
 		if (cte->sector == sio->bio_sector) {
 			sio->cte_idx = i;
-			if (cte_is_clean(cte, sio->bio_mask)) {
-				/* Clean cte */
-				if (rw == WRITE) {
-					cte_start_write(sio);
-					retval = CTE_WRITE_CLEAN;
-				} else {
-					retval = CTE_READ_CLEAN;
-				}
+			if (cte_is_clean(cte, sio->bio_mask) && rw == READ) {
+				retval = CTE_READ_CLEAN;
+				/* WRITE_CLEAN is mapped to WRITE_INVALID */
 			} else if (cte_target_is_busy(cte, sio->bio_mask)) {
 				/* Target busy */
 				if (rw == WRITE) {
