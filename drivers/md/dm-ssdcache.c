@@ -982,16 +982,16 @@ static void sio_start_write_busy(struct ssdcache_io *sio, struct bio *bio)
 
 static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
 {
+	if (!sio->sc->options.async_lookup &&
+	    !CACHE_IS_READCACHE(sio->sc)) {
+		map_secondary_bio(sio, bio);
+		ssdcache_schedule_sio(sio);
+	}
 	if (!CACHE_IS_WRITEBACK(sio->sc)) {
 		bio->bi_bdev = sio->sc->target_dev->bdev;
 	} else {
 		bio->bi_bdev = sio->sc->cache_dev->bdev;
 		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-	}
-	if (!sio->sc->options.async_lookup &&
-	    !CACHE_IS_READCACHE(sio->sc)) {
-		map_secondary_bio(sio, bio);
-		ssdcache_schedule_sio(sio);
 	}
 }
 
