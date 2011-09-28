@@ -636,6 +636,32 @@ static void cte_start_writeback(struct ssdcache_io *sio)
 	call_rcu(&oldcte->rcu, cte_reset);
 }
 
+static void cte_start_cache_write(struct ssdcache_io *sio)
+{
+	struct ssdcache_te *newcte, *oldcte;
+
+	/* Check if we should drop the old cte */
+	newcte = cte_new(sio->sc, sio->cmd, sio->cte_idx);
+	if (!newcte)
+		return;
+
+	spin_lock_irq(&sio->cmd->lock);
+	oldcte = sio->cmd->te[sio->cte_idx];
+	BUG_ON(!oldcte);
+	*newcte = *oldcte;
+
+	newcte->count++;
+	bitmap_andnot(newcte->clean, oldcte->clean, sio->bio_mask,
+		      DEFAULT_BLOCKSIZE);
+	bitmap_or(newcte->cache_busy, oldcte->cache_busy, sio->bio_mask,
+		  DEFAULT_BLOCKSIZE);
+	newcte->atime = jiffies;
+
+	rcu_assign_pointer(sio->cmd->te[sio->cte_idx], newcte);
+	spin_unlock_irq(&sio->cmd->lock);
+	call_rcu(&oldcte->rcu, cte_reset);
+}
+
 static void cte_start_target_write(struct ssdcache_io *sio)
 {
 	struct ssdcache_te *newcte, *oldcte;
@@ -986,7 +1012,12 @@ static void sio_start_write_busy(struct ssdcache_io *sio, struct bio *bio)
 	if (!CACHE_IS_READCACHE(sio->sc))
 		/* Setup clone for writing to cache device */
 		map_writeback_bio(sio, bio);
-	bio->bi_bdev = sio->sc->target_dev->bdev;
+	if (!CACHE_IS_WRITEBACK(sio->sc)) {
+		bio->bi_bdev = sio->sc->target_dev->bdev;
+	} else {
+		bio->bi_bdev = sio->sc->cache_dev->bdev;
+		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+	}
 }
 
 static void sio_start_write_miss(struct ssdcache_io *sio, struct bio *bio)
@@ -1049,49 +1080,6 @@ static bool sio_check_writeback(struct ssdcache_io *sio)
 #ifdef SSD_DEBUG
 		WPRINTK(sio, "cache sector busy");
 #endif
-		return false;
-	}
-
-	return true;
-}
-
-/*
- * sio_check_cache_write
- *
- * Check if the pending cache bio is safe for
- * submission.
- * At this point the target read has been submitted
- * and the cache should have been marked as busy.
- * So whenever the cte has been evicted or the cache
- * is not marked a busy anymore we should rather
- * drop this I/O so as to avoid cache corruption.
- */
-static bool sio_check_cache_write(struct ssdcache_io *sio)
-{
-	struct ssdcache_te *cte;
-
-	BUG_ON(!sio);
-	BUG_ON(!sio->cmd);
-	BUG_ON(sio->cte_idx == -1);
-
-	rcu_read_lock();
-	cte = rcu_dereference(sio->cmd->te[sio->cte_idx]);
-	rcu_read_unlock();
-	if (!cte) {
-		WPRINTK(sio, "invalid cte");
-		return false;
-	}
-
-	if (cte->sector != sio->bio_sector) {
-		WPRINTK(sio, "wrong sector %llx %llx",
-			(unsigned long long)cte->sector,
-			(unsigned long long)sio->bio_sector);
-		return false;
-	}
-
-	/* Check if the cache is still busy */
-	if (!cte_cache_is_busy(cte, sio->bio_mask)) {
-		WPRINTK(sio, "cache sector not busy");
 		return false;
 	}
 
@@ -1220,11 +1208,17 @@ retry:
 			} else if (cte_target_is_busy(cte, sio->bio_mask)) {
 				/* Target busy */
 				if (rw == WRITE) {
-					if (CACHE_IS_READCACHE(sio->sc))
+					if (CACHE_IS_READCACHE(sio->sc)) {
 						sio_cte_invalidate(sio);
-					else
+						retval = CTE_WRITE_CANCEL;
+					} else if ((CACHE_IS_WRITEBACK(sio->sc)) &&
+						   sio->sc->options.queue_busy) {
+						cte_start_cache_write(sio);
+						retval = CTE_WRITE_BUSY;
+					} else {
 						cte_cancel_target_write(sio);
-					retval = CTE_WRITE_CANCEL;
+						retval = CTE_WRITE_CANCEL;
+					}
 				} else {
 					retval = CTE_READ_BUSY;
 				}
@@ -1234,7 +1228,8 @@ retry:
 					if (CACHE_IS_READCACHE(sio->sc)) {
 						sio_cte_invalidate(sio);
 						retval = CTE_WRITE_CANCEL;
-					} else if (sio->sc->options.queue_busy) {
+					} else if (CACHE_IS_WRITETHROUGH(sio->sc) &&
+						   sio->sc->options.queue_busy) {
 						cte_start_target_write(sio);
 						retval = CTE_WRITE_BUSY;
 					} else {
@@ -1404,9 +1399,13 @@ retry:
 		list_del_init(&sio->list);
 		if (sio->bio) {
 			/* secondary write */
-			if (CACHE_IS_WRITETHROUGH(sio->sc)) {
-				if (!sio_check_cache_write(sio)) {
-					WPRINTK(sio, "cte busy");
+			if (!sio_match_sector(sio)) {
+				WPRINTK(sio, "target cte overrun");
+				sio->error = -ESTALE;
+				sio->sc->cache_overruns++;
+			} else if (CACHE_IS_WRITETHROUGH(sio->sc)) {
+				if (!sio_cache_is_busy(sio)) {
+					WPRINTK(sio, "cache cte not busy");
 					sio->error = -ESTALE;
 					sio->sc->cache_overruns++;
 				} else {
@@ -1418,8 +1417,8 @@ retry:
 					}
 				}
 			} else {
-				if (!sio_match_sector(sio)) {
-					WPRINTK(sio, "target cte overrun");
+				if (!sio_target_is_busy(sio)) {
+					WPRINTK(sio, "target cte not busy");
 					sio->error = -ESTALE;
 					sio->sc->cache_overruns++;
 				} else {
