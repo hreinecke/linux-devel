@@ -1801,7 +1801,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	struct ssdcache_ctx *sc;
 	struct dm_arg_set as;
 	const char *devname;
-	unsigned long num_cte;
+	unsigned long num_cmd;
 	unsigned long cdev_size;
 	unsigned long long tdev_size;
 	int r = 0;
@@ -1872,20 +1872,20 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	cdev_size = i_size_read(sc->cache_dev->bdev->bd_inode);
 	tdev_size = i_size_read(sc->target_dev->bdev->bd_inode);
 
-	num_cte = cdev_size / to_bytes(sc->block_size) / DEFAULT_ASSOCIATIVITY;
+	num_cmd = cdev_size / to_bytes(sc->block_size) / DEFAULT_ASSOCIATIVITY;
 
 	/*
 	 * Hash bit calculation might return a lower number
 	 * for the possible number of ctes, so adjust that
 	 * as well.
 	 */
-	sc->hash_bits = fls(num_cte) - 1;
-	num_cte = (1UL << sc->hash_bits);
+	sc->hash_bits = fls(num_cmd) - 1;
+	num_cmd = (1UL << sc->hash_bits);
 	sc->hash_shift = 0;
 
-	DPRINTK("block size %lu, hash bits %lu/%lu, num cte %lu",
+	DPRINTK("block size %lu, hash bits %lu/%lu, num cmd %lu",
 		to_bytes(sc->block_size), sc->hash_bits, sc->hash_shift,
-		num_cte);
+		num_cmd);
 
 	INIT_RADIX_TREE(&sc->md_tree, GFP_ATOMIC);
 
