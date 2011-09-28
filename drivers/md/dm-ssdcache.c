@@ -91,6 +91,7 @@ struct ssdcache_options {
 	unsigned async_lookup:1;
 	unsigned disable_writeback:1;
 	unsigned queue_busy:1;
+	unsigned skip_write_insert:1;
 };
 
 struct ssdcache_ctx {
@@ -1114,7 +1115,7 @@ retry:
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
 	if (!sio->cmd) {
-		if (rw == WRITE) {
+		if (sio->sc->options.skip_write_insert && rw == WRITE) {
 			/* Skip cte instantiation on WRITE */
 			sio->cte_idx = -1;
 			return CTE_WRITE_SKIP;
@@ -1687,6 +1688,10 @@ static int ssdcache_parse_options(struct dm_target *ti,
 			sc->options.disable_writeback = 1;
 			continue;
 		}
+		if (!strcasecmp(opt_name, "skip_write_insert")) {
+			sc->options.skip_write_insert = 1;
+			continue;
+		}
 	} while (argc);
 
 	return 0;
@@ -1708,10 +1713,13 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 	if (sc->options.async_lookup)
 		optnum++;
 
+	if (sc->options.queue_busy)
+		optnum++;
+
 	if (sc->options.disable_writeback)
 		optnum++;
 
-	if (sc->options.queue_busy)
+	if (sc->options.skip_write_insert)
 		optnum++;
 
 	sprintf(optstr,"%d ", optnum);
@@ -1738,12 +1746,12 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 
 	if (sc->options.async_lookup)
 		strcat(optstr, "async_lookup ");
-
 	if (sc->options.queue_busy)
 		strcat(optstr, "queue_busy ");
-
 	if (sc->options.disable_writeback)
 		strcat(optstr, "disable_writeback ");
+	if (sc->options.skip_write_insert)
+		strcat(optstr, "skip_write_insert ");
 	optstr[strlen(optstr)] = '\0';
 }
 
