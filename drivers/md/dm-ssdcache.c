@@ -116,6 +116,7 @@ struct ssdcache_ctx {
 	unsigned long cache_evictions;
 	unsigned long cache_failures;
 	unsigned long writeback_cancelled;
+	unsigned long bio_cancelled;
 };
 
 struct ssdcache_io {
@@ -829,6 +830,7 @@ static void cache_io_callback(unsigned long error, void *context)
 
 	if (!sio_match_sector(sio)) {
 		WPRINTK(sio, "cte overrun, not updating state");
+		sio->sc->cache_overruns++;
 	} else if (!sio_cache_is_busy(sio)) {
 		if (!CACHE_IS_READCACHE(sio->sc))
 			WPRINTK(sio, "cte not busy, not updating state");
@@ -865,6 +867,7 @@ static void target_io_callback(unsigned long error, void *context)
 		sio->sc->cache_overruns++;
 	} else if (!sio_match_sector(sio)) {
 		WPRINTK(sio, "cte overrun, not updating state");
+		sio->sc->cache_overruns++;
 	} else if (!sio_target_is_busy(sio)) {
 		WPRINTK(sio, "cte not busy, not updating state");
 	} else {
@@ -1364,7 +1367,7 @@ retry:
 				if (!sio_cache_is_busy(sio)) {
 					WPRINTK(sio, "cache cte not busy");
 					sio->error = -ESTALE;
-					sio->sc->cache_overruns++;
+					sio->sc->bio_cancelled++;
 				} else {
 					if (sio->sc->options.async_lookup)
 						sio_lookup_async(sio);
@@ -1377,7 +1380,7 @@ retry:
 				if (!sio_target_is_busy(sio)) {
 					WPRINTK(sio, "target cte not busy");
 					sio->error = -ESTALE;
-					sio->sc->cache_overruns++;
+					sio->sc->bio_cancelled++;
 				} else {
 					ssdcache_get_sio(sio);
 					if (sio->sc->options.async_lookup)
@@ -1946,13 +1949,14 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO:
 		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu\n"
 			 "\tmisses %lu hits %lu busy %lu overruns %lu\n"
-			 "\tbypassed %lu evicts %lu failures %lu cancelled %lu",
+			 "\tbypassed %lu evicts %lu failures %lu\n"
+			 "\twriteback cancelled %lu bio cancelled %lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
 			 sc->cache_evictions, sc->cache_failures,
-			 sc->writeback_cancelled);
+			 sc->writeback_cancelled, sc->bio_cancelled);
 		break;
 
 	case STATUSTYPE_TABLE:
