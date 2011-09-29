@@ -102,7 +102,6 @@ struct ssdcache_ctx {
 	struct radix_tree_root md_tree;
 	spinlock_t cmd_lock;
 	unsigned long hash_bits;
-	unsigned long hash_shift;
 	unsigned long block_size;
 	unsigned long block_mask;
 	sector_t data_offset;
@@ -282,7 +281,7 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_ctx *sc,
 	if (!cmd)
 		return NULL;
 	cmd->hash = hash_number;
-	cmd->num_cte = (1UL << sc->hash_shift) * DEFAULT_ASSOCIATIVITY;
+	cmd->num_cte = DEFAULT_ASSOCIATIVITY;
 	spin_lock_init(&cmd->lock);
 	cmd->atime = jiffies;
 	cmd->sc = sc;
@@ -1059,15 +1058,13 @@ static bool sio_check_writeback(struct ssdcache_io *sio)
 
 static unsigned long ssdcache_hash_64(struct ssdcache_ctx *sc, sector_t sector)
 {
-	unsigned long value, hash_number, offset, hash_mask, sector_shift;
+	unsigned long value, hash_number, sector_shift;
 
 	sector_shift = fls(sc->block_size) - 1;
-	hash_mask = (1UL << sc->hash_shift) - 1;
-	value = sector >> (sc->hash_shift + sector_shift);
-	offset = sector & hash_mask;
-	hash_number = (unsigned long)hash_64(value, sc->hash_bits - sc->hash_shift);
+	value = sector >> sector_shift;
+	hash_number = (unsigned long)hash_64(value, sc->hash_bits);
 
-	return (hash_number << sc->hash_shift) | offset;
+	return hash_number;
 }
 
 static unsigned long ssdcache_hash_wrap(struct ssdcache_ctx *sc, sector_t sector)
@@ -1075,8 +1072,8 @@ static unsigned long ssdcache_hash_wrap(struct ssdcache_ctx *sc, sector_t sector
 	unsigned long sector_shift, value, hash_mask;
 
 	sector_shift = fls(sc->block_size) - 1;
-	value = sector >> (sc->hash_shift + sector_shift);
-	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
+	value = sector >> sector_shift;
+	hash_mask = (1UL << sc->hash_bits) - 1;
 
 	return value & hash_mask;
 }
@@ -1093,9 +1090,9 @@ static unsigned long rotate(struct ssdcache_ctx *sc, unsigned long value)
 {
 	unsigned long result, hash_mask;
 
-	hash_mask = (1UL << (sc->hash_bits - sc->hash_shift)) - 1;
+	hash_mask = (1UL << sc->hash_bits) - 1;
 	result = (value << 2);
-	result |= (value >> ((sc->hash_bits - sc->hash_shift) - 2));
+	result |= (value >> (sc->hash_bits - 2));
 	if (value == (result & hash_mask))
 		result++;
 	return result & hash_mask;
@@ -1875,11 +1872,9 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 */
 	sc->hash_bits = fls(num_cmd) - 1;
 	num_cmd = (1UL << sc->hash_bits);
-	sc->hash_shift = 0;
 
-	DPRINTK("block size %lu, hash bits %lu/%lu, num cmd %lu",
-		to_bytes(sc->block_size), sc->hash_bits, sc->hash_shift,
-		num_cmd);
+	DPRINTK("block size %lu, hash bits %lu, num cmd %lu",
+		to_bytes(sc->block_size), sc->hash_bits, num_cmd);
 
 	INIT_RADIX_TREE(&sc->md_tree, GFP_ATOMIC);
 
