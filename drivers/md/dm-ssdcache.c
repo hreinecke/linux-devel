@@ -55,11 +55,6 @@ enum ssdcache_strategy_t {
 	CACHE_LFU,
 };
 
-enum ssdcache_algorithm_t {
-	CACHE_ALG_HASH64,
-	CACHE_ALG_WRAP,
-};
-
 struct ssdcache_md;
 struct ssdcache_io;
 
@@ -87,7 +82,6 @@ struct ssdcache_md {
 struct ssdcache_options {
 	enum ssdcache_mode_t mode;
 	enum ssdcache_strategy_t strategy;
-	enum ssdcache_algorithm_t algorithm;
 	unsigned async_lookup:1;
 	unsigned disable_writeback:1;
 	unsigned queue_busy:1;
@@ -137,7 +131,6 @@ struct ssdcache_io {
 
 static enum ssdcache_mode_t default_cache_mode = CACHE_MODE_WRITETHROUGH;
 static enum ssdcache_strategy_t default_cache_strategy = CACHE_LFU;
-static enum ssdcache_algorithm_t default_cache_algorithm = CACHE_ALG_WRAP;
 
 #define CACHE_IS_WRITETHROUGH(sc) \
 	((sc)->options.mode == CACHE_MODE_WRITETHROUGH)
@@ -1053,9 +1046,10 @@ static bool sio_check_writeback(struct ssdcache_io *sio)
 }
 
 /*
- * Cache lookup and I/O handling
+ * Hashing
+ *
+ * We implement double hashing to avoid hash collisions.
  */
-
 static unsigned long ssdcache_hash_64(struct ssdcache_ctx *sc, sector_t sector)
 {
 	unsigned long value, hash_number, sector_shift;
@@ -1078,22 +1072,14 @@ static unsigned long ssdcache_hash_wrap(struct ssdcache_ctx *sc, sector_t sector
 	return value & hash_mask;
 }
 
-static unsigned long hash_block(struct ssdcache_ctx *sc, sector_t sector)
-{
-	if (sc->options.algorithm == CACHE_ALG_HASH64)
-		return ssdcache_hash_64(sc, sector);
-	else
-		return ssdcache_hash_wrap(sc, sector);
-}
-
-static unsigned long rotate(struct ssdcache_ctx *sc, unsigned long value)
+static unsigned long rehash_block(struct ssdcache_ctx *sc, sector_t sector,
+				  unsigned long hash_number)
 {
 	unsigned long result, hash_mask;
 
 	hash_mask = (1UL << sc->hash_bits) - 1;
-	result = (value << 2);
-	result |= (value >> (sc->hash_bits - 2));
-	if (value == (result & hash_mask))
+	result = hash_number + ssdcache_hash_64(sc, sector);
+	if ((result & hash_mask) == hash_number)
 		result++;
 	return result & hash_mask;
 }
@@ -1108,7 +1094,7 @@ static enum cte_match_t cte_match(struct ssdcache_io *sio, int rw)
 	int invalid, oldest, i, index, busy = 0, assoc = 3;
 	enum cte_match_t retval = CTE_LOOKUP_FAILED;
 
-	hash_number = hash_block(sio->sc, sio->bio_sector);
+	hash_number = ssdcache_hash_wrap(sio->sc, sio->bio_sector);
 	if (rw == WRITE && sio->sc->options.skip_write_insert)
 		skip_cmd_instantiation = 1;
 	if (rw == WRITE && sio->sc->options.evict_on_write)
@@ -1270,7 +1256,8 @@ retry:
 		}
 	}
 	if (invalid == -1 && assoc > 0 && !sio->error) {
-		hash_number = rotate(sio->sc, hash_number);
+		hash_number = rehash_block(sio->sc, sio->bio_sector,
+					   hash_number);
 		assoc--;
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s (cte %lx:%x): retry with assoc %d",
@@ -1723,9 +1710,6 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 	if (sc->options.strategy != default_cache_strategy)
 		optnum++;
 
-	if (sc->options.algorithm != default_cache_algorithm)
-		optnum++;
-
 	if (sc->options.async_lookup)
 		optnum++;
 
@@ -1747,12 +1731,6 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 			strcat(optstr, "lfu ");
 		else
 			strcat(optstr, "lru ");
-	}
-	if (sc->options.algorithm != default_cache_algorithm) {
-		if (sc->options.algorithm == CACHE_ALG_HASH64)
-			strcat(optstr, "hash ");
-		else
-			strcat(optstr, "wrap ");
 	}
 
 	if (sc->options.async_lookup)
@@ -1821,7 +1799,6 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->block_size = DEFAULT_BLOCKSIZE;
 	sc->options.strategy = default_cache_strategy;
 	sc->options.mode = default_cache_mode;
-	sc->options.algorithm = default_cache_algorithm;
 
 	while ((argname = dm_shift_arg(&as)) != NULL) {
 		if (!strcasecmp(argname, "blocksize")) {
