@@ -1828,7 +1828,6 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			}
 		} else if (!strcasecmp(argname, "writeback")) {
 			sc->options.mode = CACHE_MODE_WRITEBACK;
-			sc->options.evict_on_write = 1;
 		} else if (!strcasecmp(argname, "writethrough")) {
 			sc->options.mode = CACHE_MODE_WRITETHROUGH;
 		} else if (!strcasecmp(argname, "readcache")) {
