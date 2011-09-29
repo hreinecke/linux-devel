@@ -1727,7 +1727,12 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 	if (sc->options.evict_on_write)
 		optnum++;
 
-	sprintf(optstr,"%d ", optnum);
+	if (!optnum) {
+		optstr[0] = '\0';
+		return;
+	}
+
+	sprintf(optstr," options %d ", optnum);
 	if (sc->options.strategy != default_cache_strategy) {
 		if (sc->options.strategy == CACHE_LFU)
 			strcat(optstr, "lfu ");
@@ -1980,7 +1985,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		else
 			strcat(modestr, "writethrough");
 		ssdcache_format_options(sc, optstr);
-		snprintf(result, maxlen, "%s %s blocksize %lu %s assoc %d options %s",
+		snprintf(result, maxlen, "%s %s blocksize %lu %s assoc %d%s",
 			 sc->target_dev->name, sc->cache_dev->name,
 			 sc->block_size, modestr, sc->options.assoc, optstr);
 		break;
