@@ -41,6 +41,7 @@
 
 #define DEFAULT_BLOCKSIZE	256
 #define DEFAULT_ALIASING	16
+#define DEFAULT_ASSOCIATIVITY	4
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -80,6 +81,7 @@ struct ssdcache_md {
 };
 
 struct ssdcache_options {
+	unsigned int assoc;
 	enum ssdcache_mode_t mode;
 	enum ssdcache_strategy_t strategy;
 	unsigned async_lookup:1;
@@ -1091,7 +1093,7 @@ static enum cte_match_t cte_match(struct ssdcache_io *sio, int rw)
 	unsigned long cte_count, oldest_count;
 	int skip_cmd_instantiation = 0;
 	int evict_cte_on_write = 0;
-	int invalid, oldest, i, index, busy = 0, assoc = 3;
+	int invalid, oldest, i, index, busy = 0, assoc = 0;
 	enum cte_match_t retval = CTE_LOOKUP_FAILED;
 
 	hash_number = ssdcache_hash_wrap(sio->sc, sio->bio_sector);
@@ -1255,10 +1257,10 @@ retry:
 			}
 		}
 	}
-	if (invalid == -1 && assoc > 0 && !sio->error) {
+	if (invalid == -1 && assoc < sio->sc->options.assoc && !sio->error) {
 		hash_number = rehash_block(sio->sc, sio->bio_sector,
 					   hash_number);
-		assoc--;
+		assoc++;
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s (cte %lx:%x): retry with assoc %d",
 			sio->nr, __FUNCTION__, sio->cmd->hash, i, assoc);
@@ -1799,6 +1801,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->block_size = DEFAULT_BLOCKSIZE;
 	sc->options.strategy = default_cache_strategy;
 	sc->options.mode = default_cache_mode;
+	sc->options.assoc = DEFAULT_ASSOCIATIVITY;
 
 	while ((argname = dm_shift_arg(&as)) != NULL) {
 		if (!strcasecmp(argname, "blocksize")) {
@@ -1808,6 +1811,15 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			if (sc->block_size < 1) {
 				ti->error = "blocksize too small";
 				sc->block_size = DEFAULT_BLOCKSIZE;
+			}
+		} else if (!strcasecmp(argname, "assoc")) {
+			if (sscanf(dm_shift_arg(&as), "%d",
+				   &sc->options.assoc) != 1) {
+				ti->error = "Invalid associativity";
+			}
+			if (sc->block_size < 1) {
+				ti->error = "Associativity must be at least 1";
+				sc->block_size = DEFAULT_ASSOCIATIVITY;
 			}
 		} else if (!strcasecmp(argname, "writeback")) {
 			sc->options.mode = CACHE_MODE_WRITEBACK;
@@ -1968,9 +1980,9 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		else
 			strcat(modestr, "writethrough");
 		ssdcache_format_options(sc, optstr);
-		snprintf(result, maxlen, "%s %s blocksize %lu %s options %s",
+		snprintf(result, maxlen, "%s %s blocksize %lu %s assoc %d options %s",
 			 sc->target_dev->name, sc->cache_dev->name,
-			 sc->block_size, modestr, optstr);
+			 sc->block_size, modestr, sc->options.assoc, optstr);
 		break;
 	}
 	return 0;
