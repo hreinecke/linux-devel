@@ -1336,18 +1336,18 @@ static void sio_lookup_async(struct ssdcache_io *sio)
 
 static void process_sio(struct work_struct *ignored)
 {
-	LIST_HEAD(tmp);
-	LIST_HEAD(defer);
 	unsigned long flags;
-	struct ssdcache_io *sio, *next;
+	struct ssdcache_io *sio = NULL;
 	int empty = 0;
 
 retry:
 	spin_lock_irqsave(&_work_lock, flags);
-	list_splice_init(&_io_work, &tmp);
-	spin_unlock_irqrestore(&_work_lock, flags);
-	list_for_each_entry_safe(sio, next, &tmp, list) {
+	if (!list_empty(&_io_work)) {
+		sio = list_first_entry(&_io_work, struct ssdcache_io, list);
 		list_del_init(&sio->list);
+	}
+	spin_unlock_irqrestore(&_work_lock, flags);
+	if (sio) {
 		if (sio->bio) {
 			/* secondary write */
 			if (sio->bio->bi_rw & REQ_FLUSH) {
@@ -1408,7 +1408,6 @@ retry:
 		ssdcache_put_sio(sio);
 	}
 	spin_lock_irqsave(&_work_lock, flags);
-	list_splice(&tmp, &_io_work);
 	empty = list_empty(&_io_work);
 	spin_unlock_irqrestore(&_work_lock, flags);
 	if (!empty)
