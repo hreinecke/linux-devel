@@ -40,7 +40,7 @@
 #define DEFAULT_CTE_NUM 4096
 
 #define DEFAULT_BLOCKSIZE	256
-#define DEFAULT_ASSOCIATIVITY	16
+#define DEFAULT_ALIASING	16
 
 /* Caching modes */
 enum ssdcache_mode_t {
@@ -76,7 +76,7 @@ struct ssdcache_md {
 	unsigned int num_cte;	/* Number of table entries */
 	unsigned long atime;
 	struct ssdcache_ctx *sc;
-	struct ssdcache_te *te[DEFAULT_ASSOCIATIVITY];	/* RCU Table entries */
+	struct ssdcache_te *te[DEFAULT_ALIASING];	/* RCU Table entries */
 };
 
 struct ssdcache_options {
@@ -274,7 +274,7 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_ctx *sc,
 	if (!cmd)
 		return NULL;
 	cmd->hash = hash_number;
-	cmd->num_cte = DEFAULT_ASSOCIATIVITY;
+	cmd->num_cte = DEFAULT_ALIASING;
 	spin_lock_init(&cmd->lock);
 	cmd->atime = jiffies;
 	cmd->sc = sc;
@@ -1840,7 +1840,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	cdev_size = i_size_read(sc->cache_dev->bdev->bd_inode);
 	tdev_size = i_size_read(sc->target_dev->bdev->bd_inode);
 
-	num_cmd = cdev_size / to_bytes(sc->block_size) / DEFAULT_ASSOCIATIVITY;
+	num_cmd = cdev_size / to_bytes(sc->block_size) / DEFAULT_ALIASING;
 
 	/*
 	 * Hash bit calculation might return a lower number
@@ -1953,7 +1953,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			 "\tbypassed %lu evicts %lu failures %lu\n"
 			 "\twriteback cancelled %lu bio cancelled %lu",
 			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
-			 (1UL << sc->hash_bits) * DEFAULT_ASSOCIATIVITY,
+			 (1UL << sc->hash_bits) * DEFAULT_ALIASING,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
 			 sc->cache_evictions, sc->cache_failures,
