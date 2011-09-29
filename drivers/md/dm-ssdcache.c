@@ -1690,18 +1690,6 @@ static int ssdcache_parse_options(struct dm_target *ti,
 			sc->options.strategy = CACHE_LRU;
 			continue;
 		}
-		if (!strcasecmp(opt_name, "writeback")) {
-			sc->options.mode = CACHE_MODE_WRITEBACK;
-			continue;
-		}
-		if (!strcasecmp(opt_name, "writethrough")) {
-			sc->options.mode = CACHE_MODE_WRITETHROUGH;
-			continue;
-		}
-		if (!strcasecmp(opt_name, "readcache")) {
-			sc->options.mode = CACHE_MODE_READCACHE;
-			continue;
-		}
 		if (!strcasecmp(opt_name, "async_lookup")) {
 			sc->options.async_lookup = 1;
 			continue;
@@ -1730,9 +1718,6 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 	if (sc->options.strategy != default_cache_strategy)
 		optnum++;
 
-	if (sc->options.mode != default_cache_mode)
-		optnum++;
-
 	if (sc->options.algorithm != default_cache_algorithm)
 		optnum++;
 
@@ -1749,14 +1734,6 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 		optnum++;
 
 	sprintf(optstr,"%d ", optnum);
-	if (sc->options.mode != default_cache_mode) {
-		if (sc->options.mode == CACHE_MODE_WRITEBACK)
-			strcat(optstr, "writeback ");
-		else if (sc->options.mode == CACHE_MODE_READCACHE)
-			strcat(optstr, "readcache ");
-		else
-			strcat(optstr, "writethrough ");
-	}
 	if (sc->options.strategy != default_cache_strategy) {
 		if (sc->options.strategy == CACHE_LFU)
 			strcat(optstr, "lfu ");
@@ -1836,21 +1813,30 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->options.mode = default_cache_mode;
 	sc->options.algorithm = default_cache_algorithm;
 
-	if (as.argc > 0) {
-		argname = dm_shift_arg(&as);
+	while ((argname = dm_shift_arg(&as)) != NULL) {
 		if (!strcasecmp(argname, "blocksize")) {
 			if (sscanf(dm_shift_arg(&as), "%lu", &sc->block_size) != 1) {
-				ti->error = "dm-ssdcache: Invalid blocksize";
+				ti->error = "Invalid blocksize";
 			}
 			if (sc->block_size < 1) {
-				ti->error = "dm-ssdcache: blocksize too small";
+				ti->error = "blocksize too small";
 				sc->block_size = DEFAULT_BLOCKSIZE;
 			}
-			argname = dm_shift_arg(&as);
-		}
-		if (!strcasecmp(argname, "options")) {
-			if (ssdcache_parse_options(ti, &as, sc))
+		} else if (!strcasecmp(argname, "writeback")) {
+			sc->options.mode = CACHE_MODE_WRITEBACK;
+		} else if (!strcasecmp(argname, "writethrough")) {
+			sc->options.mode = CACHE_MODE_WRITETHROUGH;
+		} else if (!strcasecmp(argname, "readcache")) {
+			sc->options.mode = CACHE_MODE_READCACHE;
+		} else if (!strcasecmp(argname, "options")) {
+			if (ssdcache_parse_options(ti, &as, sc)) {
+				r = -EINVAL;
 				goto bad_io_client;
+			}
+		} else {
+			ti->error = "Invalid argument";
+			r = -EINVAL;
+			goto bad_io_client;
 		}
 	}
 
@@ -1944,7 +1930,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
 	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
 	struct ssdcache_te *cte;
-	char optstr[512];
+	char optstr[512], modestr[64];
 	unsigned long nr_elems, nr_cmds = 0, nr_ctes = 0, pos = 0;
 	unsigned long nr_cache_busy = 0, nr_target_busy = 0;
 	int i, j;
@@ -1989,10 +1975,16 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		break;
 
 	case STATUSTYPE_TABLE:
+		if (sc->options.mode == CACHE_MODE_WRITEBACK)
+			strcat(modestr, "writeback");
+		else if (sc->options.mode == CACHE_MODE_READCACHE)
+			strcat(modestr, "readcache");
+		else
+			strcat(modestr, "writethrough");
 		ssdcache_format_options(sc, optstr);
-		snprintf(result, maxlen, "%s %s blocksize %lu options %s",
+		snprintf(result, maxlen, "%s %s blocksize %lu %s options %s",
 			 sc->target_dev->name, sc->cache_dev->name,
-			 sc->block_size, optstr);
+			 sc->block_size, modestr, optstr);
 		break;
 	}
 	return 0;
