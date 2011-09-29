@@ -92,6 +92,7 @@ struct ssdcache_options {
 	unsigned disable_writeback:1;
 	unsigned queue_busy:1;
 	unsigned skip_write_insert:1;
+	unsigned evict_on_write:1;
 };
 
 struct ssdcache_ctx {
@@ -1105,11 +1106,16 @@ static enum cte_match_t cte_match(struct ssdcache_io *sio, int rw)
 	unsigned long hash_number;
 	unsigned long cte_atime, oldest_atime;
 	unsigned long cte_count, oldest_count;
+	int skip_cmd_instantiation = 0;
+	int evict_cte_on_write = 0;
 	int invalid, oldest, i, index, busy = 0, assoc = 3;
 	enum cte_match_t retval = CTE_LOOKUP_FAILED;
 
 	hash_number = hash_block(sio->sc, sio->bio_sector);
-
+	if (rw == WRITE && sio->sc->options.skip_write_insert)
+		skip_cmd_instantiation = 1;
+	if (rw == WRITE && sio->sc->options.evict_on_write)
+		evict_cte_on_write = 1;
 retry:
 	oldest_atime = jiffies;
 	oldest_count = -1;
@@ -1120,7 +1126,7 @@ retry:
 	/* Lookup cmd */
 	sio->cmd = cmd_lookup(sio->sc, hash_number);
 	if (!sio->cmd) {
-		if (sio->sc->options.skip_write_insert && rw == WRITE) {
+		if (skip_cmd_instantiation) {
 			/* Skip cte instantiation on WRITE */
 			sio->cte_idx = -1;
 			return CTE_WRITE_SKIP;
@@ -1225,7 +1231,7 @@ retry:
 		if (invalid != -1)
 			break;
 		/* Skip cache eviction on WRITE */
-		if (rw == WRITE)
+		if (!evict_cte_on_write)
 			continue;
 		/* Can only eject non-busy entries */
 		if (cte_target_is_busy(cte, sio->bio_mask) ||
@@ -1296,14 +1302,12 @@ found:
 	} else if (sio->error) {
 		sio->cte_idx = -1;
 		retval = CTE_WRITE_DONE;
-	} else if (rw == WRITE) {
+	} else if (!evict_cte_on_write) {
 		sio->cte_idx = -1;
 		retval = CTE_WRITE_SKIP;
 	} else {
-#ifdef SSD_DEBUG
-		DPRINTK("%lu: %s (cte %lx:ff): %d ctes busy", sio->nr,
-			__FUNCTION__, sio->cmd->hash, busy);
-#endif
+		DPRINTK("%lu: %s (cte %lx:ff): %d/%d ctes busy", sio->nr,
+			__FUNCTION__, sio->cmd->hash, busy, assoc);
 		sio->cte_idx = -1;
 	}
 out:
@@ -1706,6 +1710,10 @@ static int ssdcache_parse_options(struct dm_target *ti,
 			sc->options.skip_write_insert = 1;
 			continue;
 		}
+		if (!strcasecmp(opt_name, "evict_on_write")) {
+			sc->options.evict_on_write = 1;
+			continue;
+		}
 	} while (argc);
 
 	return 0;
@@ -1733,6 +1741,9 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 	if (sc->options.skip_write_insert)
 		optnum++;
 
+	if (sc->options.evict_on_write)
+		optnum++;
+
 	sprintf(optstr,"%d ", optnum);
 	if (sc->options.strategy != default_cache_strategy) {
 		if (sc->options.strategy == CACHE_LFU)
@@ -1755,6 +1766,8 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 		strcat(optstr, "disable_writeback ");
 	if (sc->options.skip_write_insert)
 		strcat(optstr, "skip_write_insert ");
+	if (sc->options.evict_on_write)
+		strcat(optstr, "evict_on_write ");
 	optstr[strlen(optstr)] = '\0';
 }
 
@@ -1824,6 +1837,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			}
 		} else if (!strcasecmp(argname, "writeback")) {
 			sc->options.mode = CACHE_MODE_WRITEBACK;
+			sc->options.evict_on_write = 1;
 		} else if (!strcasecmp(argname, "writethrough")) {
 			sc->options.mode = CACHE_MODE_WRITETHROUGH;
 		} else if (!strcasecmp(argname, "readcache")) {
