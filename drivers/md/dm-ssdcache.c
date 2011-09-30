@@ -1948,7 +1948,7 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	struct ssdcache_te *cte;
 	char optstr[512], modestr[64];
 	unsigned long nr_elems, nr_cmds = 0, nr_ctes = 0, pos = 0;
-	unsigned long nr_cache_busy = 0, nr_target_busy = 0;
+	unsigned long nr_cache_busy = 0, nr_target_busy = 0, nr_cte_full = 0;
 	int i, j;
 
 	rcu_read_lock();
@@ -1970,6 +1970,9 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 					if (!bitmap_empty(cte->cache_busy,
 							  DEFAULT_BLOCKSIZE))
 						nr_cache_busy++;
+					if (bitmap_full(cte->clean,
+							DEFAULT_BLOCKSIZE))
+						nr_cte_full++;
 				}
 			}
 		}
@@ -1978,11 +1981,11 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 	rcu_read_unlock();
 	switch (type) {
 	case STATUSTYPE_INFO:
-		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu\n"
+		snprintf(result, maxlen, "cmd %lu/%lu cte %lu/%lu/%lu\n"
 			 "\tmisses %lu hits %lu busy %lu overruns %lu\n"
 			 "\tbypassed %lu evicts %lu failures %lu\n"
 			 "\twriteback cancelled %lu bio cancelled %lu",
-			 nr_cmds, (1UL << sc->hash_bits), nr_ctes,
+			 nr_cmds, (1UL << sc->hash_bits), nr_cte_full, nr_ctes,
 			 (1UL << sc->hash_bits) * DEFAULT_ALIASING,
 			 sc->cache_misses, sc->cache_hits, sc->cache_busy,
 			 sc->cache_overruns, sc->cache_bypassed,
