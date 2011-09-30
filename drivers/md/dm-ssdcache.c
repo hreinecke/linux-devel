@@ -1395,14 +1395,15 @@ static void sio_in_flight(void)
 static void process_sio(struct work_struct *ignored)
 {
 	unsigned long flags;
-	struct ssdcache_io *sio = NULL;
-	int empty = 0;
+	struct ssdcache_io *sio;
 
 retry:
 	spin_lock_irqsave(&_work_lock, flags);
 	if (!list_empty(&_io_work)) {
 		sio = list_first_entry(&_io_work, struct ssdcache_io, list);
 		list_del_init(&sio->list);
+	} else {
+		sio = NULL;
 	}
 	spin_unlock_irqrestore(&_work_lock, flags);
 	if (sio) {
@@ -1460,12 +1461,8 @@ retry:
 			WPRINTK(sio, "invalid workqueue state");
 		}
 		ssdcache_put_sio(sio);
-	}
-	spin_lock_irqsave(&_work_lock, flags);
-	empty = list_empty(&_io_work);
-	spin_unlock_irqrestore(&_work_lock, flags);
-	if (!empty)
 		goto retry;
+	}
 }
 
 static int ssdcache_map(struct dm_target *ti, struct bio *bio,
