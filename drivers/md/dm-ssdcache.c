@@ -21,6 +21,7 @@
 
 // #define SSD_DEBUG
 #define SSD_LOG
+#define SSDCACHE_USE_RADIX_TREE
 
 #ifdef SSD_LOG
 #define DPRINTK( s, arg... ) printk(DM_MSG_PREFIX s "\n", ##arg)
@@ -1510,7 +1511,10 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio_bio_mask(sio, bio);
 	map_context->ptr = sio;
 	if (bio->bi_rw & REQ_FLUSH) {
+		DPRINTK("%lu: %s: flush start", sio->nr, __FUNCTION__);
+#ifdef SSD_DEBUG
 		sio_in_flight();
+#endif
 		sio->bio = bio;
 		bio_get(bio);
 		map_context->ptr = NULL;
