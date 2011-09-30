@@ -95,7 +95,11 @@ struct ssdcache_ctx {
 	struct dm_dev *target_dev;
 	struct dm_dev *cache_dev;
 	struct dm_io_client *iocp;
+#ifdef SSDCACHE_USE_RADIX_TREE
 	struct radix_tree_root md_tree;
+#else
+	struct ssdcache_md **md_table;
+#endif
 	spinlock_t cmd_lock;
 	unsigned long hash_bits;
 	unsigned long block_size;
@@ -262,7 +266,11 @@ static inline struct ssdcache_md *cmd_lookup(struct ssdcache_ctx *sc,
 	struct ssdcache_md *cmd;
 
 	rcu_read_lock();
+#ifdef SSDCACHE_USE_RADIX_TREE
 	cmd = radix_tree_lookup(&sc->md_tree, hash_number);
+#else
+	cmd = rcu_dereference(sc->md_table[hash_number]);
+#endif
 	rcu_read_unlock();
 	return cmd;
 }
@@ -281,22 +289,52 @@ static inline struct ssdcache_md *cmd_insert(struct ssdcache_ctx *sc,
 	cmd->atime = jiffies;
 	cmd->sc = sc;
 
+#ifdef SSDCACHE_USE_RADIX_TREE
 	if (radix_tree_preload(GFP_NOIO)) {
 		mempool_free(cmd, _cmd_pool);
 		return NULL;
 	}
-
+#endif
 	spin_lock(&sc->cmd_lock);
+
+#ifdef SSDCACHE_USE_RADIX_TREE
 	if (radix_tree_insert(&sc->md_tree, hash_number, cmd)) {
 		mempool_free(cmd, _cmd_pool);
 		cmd = radix_tree_lookup(&sc->md_tree, hash_number);
 		BUG_ON(!cmd);
 		BUG_ON(cmd->hash != hash_number);
 	}
+#else
+	rcu_assign_pointer(sc->md_table[hash_number], cmd);
+#endif
 	spin_unlock(&sc->cmd_lock);
 
+#ifdef SSDCACHE_USE_RADIX_TREE
 	radix_tree_preload_end();
+#endif
 	return cmd;
+}
+
+static void cmd_remove(struct ssdcache_md *cmd)
+{
+	struct ssdcache_te *cte;
+	int j;
+
+	if (!cmd)
+		return;
+
+	for (j = 0; j < cmd->num_cte; j++) {
+		spin_lock_irq(&cmd->lock);
+		cte = cmd->te[j];
+		if (cte)
+			rcu_assign_pointer(cmd->te[j], NULL);
+		spin_unlock_irq(&cmd->lock);
+		if (cte) {
+			synchronize_rcu();
+			mempool_free(cte, _cte_pool);
+		}
+	}
+	mempool_free(cmd, _cmd_pool);
 }
 
 #define cte_bio_align(s,b) ((b)->bi_sector & ~(s)->block_mask)
@@ -1883,8 +1921,12 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	DPRINTK("block size %lu, hash bits %lu, num cmd %lu",
 		to_bytes(sc->block_size), sc->hash_bits, num_cmd);
 
+#ifdef SSDCACHE_USE_RADIX_TREE
 	INIT_RADIX_TREE(&sc->md_tree, GFP_ATOMIC);
-
+#else
+	sc->md_table = vmalloc(num_cmd * sizeof(struct ssdcache_md *));
+	memset(sc->md_table, 0, num_cmd * sizeof(struct ssdcache_md *));
+#endif
 	sc->data_offset = 0;
 	sc->block_mask = sc->block_size - 1;
 	sc->nr_sio = 0;
@@ -1905,35 +1947,40 @@ bad:
 static void ssdcache_dtr(struct dm_target *ti)
 {
 	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
-	struct ssdcache_te *cte;
+#ifdef SSDCACHE_USE_RADIX_TREE
 	unsigned long pos = 0, nr_cmds;
-	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
-	int i, j;
+	struct ssdcache_md *cmds[MIN_CMD_NUM];
+#endif
+	struct ssdcache_md *cmd;
+	int i;
 
+#ifdef SSDCACHE_USE_RADIX_TREE
 	do {
+		spin_lock(&sc->cmd_lock);
 		nr_cmds = radix_tree_gang_lookup(&sc->md_tree,
 						 (void **)cmds, pos,
 						 MIN_CMD_NUM);
 		for (i = 0; i < nr_cmds; i++) {
 			pos = cmds[i]->hash;
 			cmd = radix_tree_delete(&sc->md_tree, pos);
-			spin_lock_irq(&cmd->lock);
-			for (j = 0; j < cmd->num_cte; j++) {
-				if (cmd->te[j]) {
-					cte = cmd->te[j];
-					rcu_assign_pointer(cmd->te[j], NULL);
-					spin_unlock_irq(&cmd->lock);
-					synchronize_rcu();
-					mempool_free(cte, _cte_pool);
-					spin_lock_irq(&cmd->lock);
-				}
-			}
-			spin_unlock_irq(&cmd->lock);
-			mempool_free(cmd, _cmd_pool);
+			spin_unlock(&sc->cmd_lock);
+			cmd_remove(cmd);
+			spin_lock(&sc->cmd_lock);
 		}
+		spin_unlock(&sc->cmd_lock);
 		pos++;
 	} while (nr_cmds == MIN_CMD_NUM);
-
+#else
+	for (i = 0; i < (1UL << sc->hash_bits); i++) {
+		spin_lock(&sc->cmd_lock);
+		cmd = sc->md_table[i];
+		rcu_assign_pointer(sc->md_table[i], NULL);
+		spin_unlock(&sc->cmd_lock);
+		synchronize_rcu();
+		cmd_remove(cmd);
+	}
+	vfree(sc->md_table);
+#endif
 	dm_io_client_destroy(sc->iocp);
 	dm_put_device(ti, sc->target_dev);
 	dm_put_device(ti, sc->cache_dev);
@@ -1944,14 +1991,19 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 			 char *result, unsigned int maxlen)
 {
 	struct ssdcache_ctx *sc = (struct ssdcache_ctx *) ti->private;
-	struct ssdcache_md *cmds[MIN_CMD_NUM], *cmd;
+#ifdef SSDCACHE_USE_RADIX_TREE
+	unsigned long nr_elems, pos = 0;
+	struct ssdcache_md *cmds[MIN_CMD_NUM];
+#endif
+	struct ssdcache_md *cmd;
 	struct ssdcache_te *cte;
 	char optstr[512], modestr[64];
-	unsigned long nr_elems, nr_cmds = 0, nr_ctes = 0, pos = 0;
+	unsigned long nr_cmds = 0, nr_ctes = 0;
 	unsigned long nr_cache_busy = 0, nr_target_busy = 0, nr_cte_full = 0;
 	int i, j;
 
 	rcu_read_lock();
+#ifdef SSDCACHE_USE_RADIX_TREE
 	do {
 		nr_elems = radix_tree_gang_lookup(&sc->md_tree,
 						 (void **)cmds, pos,
@@ -1978,6 +2030,29 @@ static int ssdcache_status(struct dm_target *ti, status_type_t type,
 		}
 		pos++;
 	} while (nr_elems == MIN_CMD_NUM);
+#else
+	for (i = 0; i < (1UL << sc->hash_bits); i++) {
+		cmd = rcu_dereference(sc->md_table[i]);
+		if (cmd) {
+			nr_cmds++;
+			for (j = 0; j < cmd->num_cte; j++) {
+				cte = rcu_dereference(cmd->te[j]);
+				if (cte) {
+					nr_ctes++;
+					if (!bitmap_empty(cte->target_busy,
+							  DEFAULT_BLOCKSIZE))
+						nr_target_busy++;
+					if (!bitmap_empty(cte->cache_busy,
+							  DEFAULT_BLOCKSIZE))
+						nr_cache_busy++;
+					if (bitmap_full(cte->clean,
+							DEFAULT_BLOCKSIZE))
+						nr_cte_full++;
+				}
+			}
+		}
+	}
+#endif
 	rcu_read_unlock();
 	switch (type) {
 	case STATUSTYPE_INFO:
