@@ -853,12 +853,7 @@ static void target_io_callback(unsigned long error, void *context)
 {
 	struct ssdcache_io *sio = context;
 
-	if (sio->bio->bi_rw & REQ_FLUSH) {
-		DPRINTK("%lu: %s: data flush done", sio->nr, __FUNCTION__);
-		bio_endio(sio->bio, 0);
-		bio_put(sio->bio);
-		sio->bio = NULL;
-	} else if (!sio->cmd) {
+	if (!sio->cmd) {
 #ifdef SSD_DEBUG
 		DPRINTK("%lu: %s: cte lookup not finished",
 			sio->nr, __FUNCTION__);
@@ -1334,6 +1329,30 @@ static void sio_lookup_async(struct ssdcache_io *sio)
 	}
 }
 
+static void sio_in_flight(void)
+{
+	struct ssdcache_io *sio;
+	unsigned long flags;
+	int in_flight = 0;
+
+	spin_lock_irqsave(&_work_lock, flags);
+	list_for_each_entry(sio, &_io_work, list) {
+		in_flight++;
+	}
+	spin_unlock_irqrestore(&_work_lock, flags);
+	DPRINTK("%d sios in flight", in_flight);
+}
+
+/*
+ * process_sio
+ *
+ * Using list_splice() here shifts processing onto
+ * a local list, so we can't figure out how many
+ * sios are still pending.
+ * Using an open-coded retry loop allows us to
+ * traverse the list of outstanding requests
+ * even from another context/function.
+ */
 static void process_sio(struct work_struct *ignored)
 {
 	unsigned long flags;
@@ -1351,16 +1370,12 @@ retry:
 		if (sio->bio) {
 			/* secondary write */
 			if (sio->bio->bi_rw & REQ_FLUSH) {
-				if (bio_cur_bytes(sio->bio)) {
-					ssdcache_get_sio(sio);
-					write_to_target(sio, sio->bio);
-				} else {
-					DPRINTK("%lu: %s: nodata flush done",
-						sio->nr, __FUNCTION__);
-					bio_endio(sio->bio, 0);
-					bio_put(sio->bio);
-					sio->bio = NULL;
-				}
+				/* DM only sends empty flushes */
+				DPRINTK("%lu: %s: flush done",
+					sio->nr, __FUNCTION__);
+				bio_endio(sio->bio, 0);
+				bio_put(sio->bio);
+				sio->bio = NULL;
 			} else if (!sio_match_sector(sio)) {
 				WPRINTK(sio, "target cte overrun");
 				sio->error = -ESTALE;
@@ -1457,7 +1472,7 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 	sio_bio_mask(sio, bio);
 	map_context->ptr = sio;
 	if (bio->bi_rw & REQ_FLUSH) {
-		DPRINTK("%lu: %s: flush start", sio->nr, __FUNCTION__);
+		sio_in_flight();
 		sio->bio = bio;
 		bio_get(bio);
 		map_context->ptr = NULL;
