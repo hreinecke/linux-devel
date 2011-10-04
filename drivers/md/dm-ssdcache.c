@@ -997,12 +997,6 @@ static void sio_start_prefetch(struct ssdcache_io *sio, struct bio *bio)
 	bio->bi_bdev = sio->sc->target_dev->bdev;
 }
 
-static void sio_start_read_hit(struct ssdcache_io *sio, struct bio *bio)
-{
-	bio->bi_bdev = sio->sc->cache_dev->bdev;
-	bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
-}
-
 /*
  * sio_start_write_busy
  *
@@ -1561,7 +1555,10 @@ static int ssdcache_map(struct dm_target *ti, struct bio *bio,
 			(unsigned long long)bio->bi_sector,
 			bio_cur_bytes(bio));
 #endif
-		sio_start_read_hit(sio, bio);
+		bio->bi_bdev = sio->sc->cache_dev->bdev;
+		bio->bi_sector = to_cache_sector(sio, bio->bi_sector);
+		map_context->ptr = NULL;
+		ssdcache_put_sio(sio);
 		break;
 	case CTE_READ_BUSY:
 		WPRINTK(sio, "read hit busy %llx %u",
