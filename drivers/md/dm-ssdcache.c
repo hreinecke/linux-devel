@@ -1887,7 +1887,6 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->options.strategy = default_cache_strategy;
 	sc->options.mode = default_cache_mode;
 	sc->options.assoc = DEFAULT_ASSOCIATIVITY;
-	sc->options.cmd_preload = 1;
 
 	while ((argname = dm_shift_arg(&as)) != NULL) {
 		if (!strcasecmp(argname, "blocksize")) {
