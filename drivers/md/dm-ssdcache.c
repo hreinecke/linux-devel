@@ -90,6 +90,7 @@ struct ssdcache_options {
 	unsigned queue_busy:1;
 	unsigned skip_write_insert:1;
 	unsigned evict_on_write:1;
+	unsigned cmd_preload:1;
 };
 
 struct ssdcache_ctx {
@@ -1753,6 +1754,10 @@ static int ssdcache_parse_options(struct dm_target *ti,
 			sc->options.evict_on_write = 1;
 			continue;
 		}
+		if (!strcasecmp(opt_name, "cmd_preload")) {
+			sc->options.cmd_preload = 1;
+			continue;
+		}
 	} while (argc);
 
 	return 0;
@@ -1780,6 +1785,9 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 	if (sc->options.evict_on_write)
 		optnum++;
 
+	if (sc->options.cmd_preload)
+		optnum++;
+
 	if (!optnum) {
 		optstr[0] = '\0';
 		return;
@@ -1803,6 +1811,8 @@ void ssdcache_format_options(struct ssdcache_ctx *sc, char *optstr)
 		strcat(optstr, "skip_write_insert ");
 	if (sc->options.evict_on_write)
 		strcat(optstr, "evict_on_write ");
+	if (sc->options.cmd_preload)
+		strcat(optstr, "cmd_preload ");
 	optstr[strlen(optstr)] = '\0';
 }
 
@@ -1860,6 +1870,7 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->options.strategy = default_cache_strategy;
 	sc->options.mode = default_cache_mode;
 	sc->options.assoc = DEFAULT_ASSOCIATIVITY;
+	sc->options.cmd_preload = 1;
 
 	while ((argname = dm_shift_arg(&as)) != NULL) {
 		if (!strcasecmp(argname, "blocksize")) {
@@ -1931,6 +1942,12 @@ static int ssdcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->data_offset = 0;
 	sc->block_mask = sc->block_size - 1;
 	sc->nr_sio = 0;
+	if (sc->options.cmd_preload) {
+		int i;
+
+		for (i = 0; i < num_cmd; i++)
+			cmd_insert(sc, i);
+	}
 	ti->num_flush_requests = 1;
 	ti->num_discard_requests = 1;
 	ti->private = sc;
