@@ -294,6 +294,16 @@ config SENSORS_ATXP1
 	  This driver can also be built as a module.  If so, the module
 	  will be called atxp1.
 
+config SENSORS_DOVE
+	tristate "Temperature sensor for Marvell Dove SoC"
+	depends on ARCH_DOVE
+	help
+	  If you say yes here you get support for Power and Voltage
+	  monitoring on Marvell Dove SoC.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called dove.
+
 config SENSORS_DS620
 	tristate "Dallas Semiconductor DS620"
 	depends on I2C

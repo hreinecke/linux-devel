@@ -114,6 +114,14 @@ void __init dove_rtc_init(void)
 }
 
 /*****************************************************************************
+ * SoC hwmon Thermal Sensor
+ ****************************************************************************/
+void __init dove_hwmon_init(void)
+{
+	platform_device_register_simple("dove-temp", 0, NULL, 0);
+}
+
+/*****************************************************************************
  * SATA
  ****************************************************************************/
 void __init dove_sata_init(struct mv_sata_platform_data *sata_data)

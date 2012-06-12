@@ -78,6 +78,7 @@ static void __init cubox_init(void)
 	dove_init();
 
 	dove_ge00_init(&cubox_ge00_data);
+	dove_hwmon_init();
 	dove_ehci0_init();
 	dove_ehci1_init();
 	dove_sata_init(&cubox_sata_data);
