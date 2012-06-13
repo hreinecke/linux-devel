@@ -1,7 +1,7 @@
 /*
- * arch/arm/mach-dove/dove-db-setup.c
+ * arch/arm/mach-dove/cubox-setup.c
  *
- * Marvell DB-MV88AP510-BP Development Board Setup
+ * SolidRun CuBox platform setup file
  *
  * This file is licensed under the terms of the GNU General Public
  * License version 2.  This program is licensed "as is" without any
@@ -68,6 +68,31 @@ static int __init cubox_pci_init(void)
 subsys_initcall(cubox_pci_init);
 
 /*****************************************************************************
+ * LED
+ ****************************************************************************/
+static struct gpio_led cubox_led_pins[] = {
+	{
+		.name			= "cubox:red:health",
+		.default_trigger	= "default-on",
+		.gpio			= 18,
+		.active_low		= 1,
+	},
+};
+
+static struct gpio_led_platform_data cubox_led_data = {
+	.leds		= cubox_led_pins,
+	.num_leds	= ARRAY_SIZE(cubox_led_pins),
+};
+
+static struct platform_device cubox_leds = {
+	.name	= "leds-gpio",
+	.id	= -1,
+	.dev	= {
+		.platform_data	= &cubox_led_data,
+	}
+};
+
+/*****************************************************************************
  * Board Init
  ****************************************************************************/
 static void __init cubox_init(void)
@@ -91,6 +116,7 @@ static void __init cubox_init(void)
 	dove_i2c_init();
 	spi_register_board_info(cubox_spi_flash_info,
 				ARRAY_SIZE(cubox_spi_flash_info));
+	platform_device_register(&cubox_leds);
 }
 
 MACHINE_START(CUBOX, "SolidRun CuBox")
