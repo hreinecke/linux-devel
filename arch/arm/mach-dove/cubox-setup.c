@@ -22,6 +22,8 @@
 #include <linux/spi/spi.h>
 #include <linux/spi/flash.h>
 #include <linux/gpio.h>
+#include <linux/leds.h>
+#include <media/gpio-ir-recv.h>
 #include <asm/mach-types.h>
 #include <asm/mach/arch.h>
 #include <mach/dove.h>
@@ -66,6 +68,22 @@ static int __init cubox_pci_init(void)
 }
 
 subsys_initcall(cubox_pci_init);
+
+/*****************************************************************************
+ * IR
+ ****************************************************************************/
+static struct gpio_ir_recv_platform_data cubox_ir_data = {
+	.gpio_nr = 19,
+	.active_low = 1,
+};
+
+static struct platform_device cubox_ir = {
+	.name   = "gpio-rc-recv",
+	.id     = -1,
+	.dev    = {
+		.platform_data  = &cubox_ir_data,
+	}
+};
 
 /*****************************************************************************
  * LED
@@ -117,6 +135,7 @@ static void __init cubox_init(void)
 	spi_register_board_info(cubox_spi_flash_info,
 				ARRAY_SIZE(cubox_spi_flash_info));
 	platform_device_register(&cubox_leds);
+	platform_device_register(&cubox_ir);
 }
 
 MACHINE_START(CUBOX, "SolidRun CuBox")
