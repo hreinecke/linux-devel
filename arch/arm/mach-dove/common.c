@@ -32,6 +32,7 @@
 #include <plat/common.h>
 #include <plat/addr-map.h>
 #include "common.h"
+#include "clock.h"
 
 static int get_tclk(void);
 
@@ -78,6 +79,7 @@ static void __init clk_init(void)
 				       get_tclk());
 
 	orion_clkdev_init(tclk);
+	dove_clkdev_init(tclk);
 }
 
 /*****************************************************************************

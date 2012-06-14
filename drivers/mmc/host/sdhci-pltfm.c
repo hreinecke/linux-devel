@@ -147,6 +147,10 @@ struct sdhci_host *sdhci_pltfm_init(struct platform_device *pdev,
 		goto err_remap;
 	}
 
+	pltfm_host->clk = clk_get(&pdev->dev, NULL);
+	if (!IS_ERR(pltfm_host->clk)) {
+		clk_prepare_enable(pltfm_host->clk);
+	}
 	platform_set_drvdata(pdev, host);
 
 	return host;
@@ -165,7 +169,12 @@ void sdhci_pltfm_free(struct platform_device *pdev)
 {
 	struct sdhci_host *host = platform_get_drvdata(pdev);
 	struct resource *iomem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 
+	if (!IS_ERR(pltfm_host->clk)) {
+		clk_disable_unprepare(pltfm_host->clk);
+		clk_put(pltfm_host->clk);
+	}
 	iounmap(host->ioaddr);
 	release_mem_region(iomem->start, resource_size(iomem));
 	sdhci_free_host(host);
