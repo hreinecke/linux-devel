@@ -245,6 +245,9 @@ __v7_setup:
 #endif
 
 3:	mov	r10, #0
+	#ifdef CONFIG_CPU_PJ4_ERRATA_4574_4731
+	mcr	p15, 0, r10, c7, c5, 0		@ I+BTB cache invalidate
+	#endif
 	mcr	p15, 0, r10, c7, c5, 0		@ I+BTB cache invalidate
 	dsb
 #ifdef CONFIG_MMU

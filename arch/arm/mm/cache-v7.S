@@ -28,6 +28,9 @@
  */
 ENTRY(v7_flush_icache_all)
 	mov	r0, #0
+#ifdef CONFIG_CPU_PJ4_ERRATA_4574_4731
+	mcr	p15, 0, r0, c7, c5, 0			@ I+BTB cache invalidate
+#endif
 	ALT_SMP(mcr	p15, 0, r0, c7, c1, 0)		@ invalidate I-cache inner shareable
 	ALT_UP(mcr	p15, 0, r0, c7, c5, 0)		@ I+BTB cache invalidate
 	mov	pc, lr
@@ -113,6 +116,9 @@ ENTRY(v7_flush_kern_cache_all)
  THUMB(	stmfd	sp!, {r4-r7, r9-r11, lr}	)
 	bl	v7_flush_dcache_all
 	mov	r0, #0
+#ifdef CONFIG_CPU_PJ4_ERRATA_4574_4731
+	mcr	p15, 0, r0, c7, c5, 0		@ I+BTB cache invalidate
+#endif
 	ALT_SMP(mcr	p15, 0, r0, c7, c1, 0)	@ invalidate I-cache inner shareable
 	ALT_UP(mcr	p15, 0, r0, c7, c5, 0)	@ I+BTB cache invalidate
  ARM(	ldmfd	sp!, {r4-r5, r7, r9-r11, lr}	)
@@ -195,11 +201,17 @@ ENTRY(v7_coherent_user_range)
 	sub	r3, r2, #1
 	bic	r12, r0, r3
 2:
+#ifdef CONFIG_CPU_PJ4_ERRATA_4574_4731
+ USER(	mcr	p15, 0, r0, c7, c5, 1	)	@ invalidate I line
+#endif
  USER(	mcr	p15, 0, r12, c7, c5, 1	)	@ invalidate I line
 	add	r12, r12, r2
 	cmp	r12, r1
 	blo	2b
 	mov	r0, #0
+#ifdef CONFIG_CPU_PJ4_ERRATA_4574_4731
+	mcr	p15, 0, r0, c7, c5, 0		@ I+BTB cache invalidate
+#endif
 	ALT_SMP(mcr	p15, 0, r0, c7, c1, 6)	@ invalidate BTB Inner Shareable
 	ALT_UP(mcr	p15, 0, r0, c7, c5, 6)	@ invalidate BTB
 	dsb

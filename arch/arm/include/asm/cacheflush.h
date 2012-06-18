@@ -201,7 +201,12 @@ extern void copy_to_user_page(struct vm_area_struct *, struct page *,
 
 static inline void __flush_icache_all(void)
 {
+#ifdef CONFIG_CPU_PJ4_ERRATA_4574_4731
+	__flush_icache_all_generic();
+	__flush_icache_all_generic();
+#else
 	__flush_icache_preferred();
+#endif
 }
 
 #define flush_cache_all()		__cpuc_flush_kern_all()
