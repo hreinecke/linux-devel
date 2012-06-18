@@ -389,7 +389,15 @@ local_flush_tlb_page(struct vm_area_struct *vma, unsigned long uaddr)
 			asm("mcr p15, 0, %0, c8, c5, 0" : : "r" (zero) : "cc");
 	}
 
+#ifdef CONFIG_CPU_PJ4_ERRATA_4315
+	if (tlb_flag(TLB_V6_U_PAGE)) {
+		unsigned long asid = ASID(vma->vm_mm);
+
+		asm("mcr p15, 0, %0, c8, c7, 2" : : "r" (asid) : "cc");
+	}
+#else
 	tlb_op(TLB_V6_U_PAGE, "c8, c7, 1", uaddr);
+#endif
 	tlb_op(TLB_V6_D_PAGE, "c8, c6, 1", uaddr);
 	tlb_op(TLB_V6_I_PAGE, "c8, c5, 1", uaddr);
 #ifdef CONFIG_ARM_ERRATA_720789
@@ -419,7 +427,11 @@ static inline void local_flush_tlb_kernel_page(unsigned long kaddr)
 	if (!tlb_flag(TLB_V4_I_PAGE) && tlb_flag(TLB_V4_I_FULL))
 		asm("mcr p15, 0, %0, c8, c5, 0" : : "r" (zero) : "cc");
 
+#ifdef CONFIG_CPU_PJ4_ERRATA_4315
+	tlb_op(TLB_V6_U_PAGE, "c8, c7, 0", (0));
+#else
 	tlb_op(TLB_V6_U_PAGE, "c8, c7, 1", kaddr);
+#endif
 	tlb_op(TLB_V6_D_PAGE, "c8, c6, 1", kaddr);
 	tlb_op(TLB_V6_I_PAGE, "c8, c5, 1", kaddr);
 	tlb_op(TLB_V7_UIS_PAGE, "c8, c3, 1", kaddr);

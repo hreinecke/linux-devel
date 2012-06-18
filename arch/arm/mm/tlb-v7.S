@@ -36,11 +36,18 @@ ENTRY(v7wbi_flush_user_tlb_range)
 	vma_vm_mm r3, r2			@ get vma->vm_mm
 	mmid	r3, r3				@ get vm_mm->context.id
 	dsb
+#ifndef CONFIG_CPU_PJ4_ERRATA_4315
 	mov	r0, r0, lsr #PAGE_SHIFT		@ align address
 	mov	r1, r1, lsr #PAGE_SHIFT
 	asid	r3, r3				@ mask ASID
 	orr	r0, r3, r0, lsl #PAGE_SHIFT	@ Create initial MVA
 	mov	r1, r1, lsl #PAGE_SHIFT
+#else
+	asid    r0, r3                          @ mask ASID
+	mcr     p15, 0, r0, c8, c7, 2           @ TLB invalidate U ASID
+	vma_vm_flags r2, r2                     @ get vma->vm_flags
+	b       2f
+#endif
 1:
 	ALT_SMP(mcr	p15, 0, r0, c8, c3, 1)	@ TLB invalidate U MVA (shareable)
 	ALT_UP(mcr	p15, 0, r0, c8, c7, 1)	@ TLB invalidate U MVA
@@ -48,6 +55,7 @@ ENTRY(v7wbi_flush_user_tlb_range)
 	add	r0, r0, #PAGE_SZ
 	cmp	r0, r1
 	blo	1b
+2:
 	dsb
 	mov	pc, lr
 ENDPROC(v7wbi_flush_user_tlb_range)
@@ -66,12 +74,18 @@ ENTRY(v7wbi_flush_kern_tlb_range)
 	mov	r1, r1, lsr #PAGE_SHIFT
 	mov	r0, r0, lsl #PAGE_SHIFT
 	mov	r1, r1, lsl #PAGE_SHIFT
+#ifdef CONFIG_CPU_PJ4_ERRATA_4315
+	mov     r2, #0x0
+	mcr     p15, 0, r2, c8, c7, 0           @ TLB invalidate U ASID all
+	b       2f
+#endif
 1:
 	ALT_SMP(mcr	p15, 0, r0, c8, c3, 1)	@ TLB invalidate U MVA (shareable)
 	ALT_UP(mcr	p15, 0, r0, c8, c7, 1)	@ TLB invalidate U MVA
 	add	r0, r0, #PAGE_SZ
 	cmp	r0, r1
 	blo	1b
+2:
 	dsb
 	isb
 	mov	pc, lr
