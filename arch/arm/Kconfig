@@ -1370,6 +1370,20 @@ config PL310_ERRATA_769419
 	  on systems with an outer cache, the store buffer is drained
 	  explicitly.
 
+config CPU_PJ4_ERRATA_4574_4731
+	bool "Marvell CPU errata 4574 and 4731 S/W fix"
+	depends on CPU_PJ4
+	help
+	  Say Y to enable Marvell CPU errata S/W workaround for
+	  #4574 and #4731
+
+config CPU_PJ4_ERRATA_4315
+	bool "Marvell CPU errata 4315 S/W fix"
+	depends on CPU_PJ4
+       	help
+	  Say Y to enable Marvell CPU errata S/W workaround for
+	  #4315
+
 endmenu
 
 source "arch/arm/common/Kconfig"
