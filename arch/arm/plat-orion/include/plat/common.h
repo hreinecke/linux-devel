@@ -10,6 +10,7 @@
 
 #ifndef __PLAT_COMMON_H
 #include <linux/mv643xx_eth.h>
+#include <linux/ata_platform.h>
 
 struct dsa_platform_data;
 
