@@ -70,6 +70,14 @@ static int __init cubox_pci_init(void)
 subsys_initcall(cubox_pci_init);
 
 /*****************************************************************************
+ * SPDIF
+ ****************************************************************************/
+static struct platform_device cubox_spdif = {
+	.name   = "kirkwood-spdif-audio",
+	.id     = 1,
+};
+
+/*****************************************************************************
  * IR
  ****************************************************************************/
 static struct gpio_ir_recv_platform_data cubox_ir_data = {
@@ -127,11 +135,13 @@ static void __init cubox_init(void)
 	dove_sata_init(&cubox_sata_data);
 	dove_sdio0_init();
 	dove_sdio1_init();
+	dove_i2s1_init();
 	dove_spi0_init();
 	dove_spi1_init();
 	dove_uart0_init();
 	dove_uart1_init();
 	dove_i2c_init();
+	platform_device_register(&cubox_spdif);
 	spi_register_board_info(cubox_spi_flash_info,
 				ARRAY_SIZE(cubox_spi_flash_info));
 	platform_device_register(&cubox_leds);

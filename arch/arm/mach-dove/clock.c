@@ -79,8 +79,8 @@ void __init dove_clkdev_init(struct clk *tclk)
 	orion_clkdev_add(NULL, "sata_mv.1", clk_sata);
 	orion_clkdev_add(NULL, "dove-nand", clk_nand);
 	orion_clkdev_add(NULL, "cafe1000-ccic.0", clk_camera);
-	orion_clkdev_add(NULL, "mv88fx_snd.0", clk_i2s0);
-	orion_clkdev_add(NULL, "mv88fx_snd.1", clk_i2s1);
+	orion_clkdev_add(NULL, "kirkwood-i2s.0", clk_i2s0);
+	orion_clkdev_add(NULL, "kirkwood-i2s.1", clk_i2s1);
 	orion_clkdev_add(NULL, "crypto", clk_cesa);
 	orion_clkdev_add("AC97CLK", NULL, clk_ac97);
 	orion_clkdev_add("PDMA", NULL, clk_pdma);

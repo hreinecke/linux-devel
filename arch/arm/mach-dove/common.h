@@ -39,6 +39,8 @@ void dove_spi1_init(void);
 void dove_i2c_init(void);
 void dove_sdio0_init(void);
 void dove_sdio1_init(void);
+void dove_i2s0_init(void);
+void dove_i2s1_init(void);
 void dove_restart(char, const char *);
 
 #endif
