@@ -42,5 +42,8 @@ void dove_sdio1_init(void);
 void dove_i2s0_init(void);
 void dove_i2s1_init(void);
 void dove_restart(char, const char *);
+void dove_vmeta_init(void);
+void dove_gpu_init(void);
+void dove_tag_fixup_mem32(struct tag *t, char **from, struct meminfo *meminfo);
 
 #endif

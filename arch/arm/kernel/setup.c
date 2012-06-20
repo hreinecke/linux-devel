@@ -914,8 +914,10 @@ static struct machine_desc * __init setup_machine_tags(unsigned int nr)
 		tags = (struct tag *)&init_tags;
 	}
 
+#ifndef CONFIG_ARCH_DOVE
 	if (mdesc->fixup)
 		mdesc->fixup(tags, &from, &meminfo);
+#endif
 
 	if (tags->hdr.tag == ATAG_CORE) {
 		if (meminfo.nr_banks != 0)
@@ -923,6 +925,11 @@ static struct machine_desc * __init setup_machine_tags(unsigned int nr)
 		save_atags(tags);
 		parse_tags(tags);
 	}
+
+#ifdef CONFIG_ARCH_DOVE
+	if (mdesc->fixup)
+		mdesc->fixup(tags, &from, &meminfo);
+#endif
 
 	/* parse_early_param needs a boot_command_line */
 	strlcpy(boot_command_line, from, COMMAND_LINE_SIZE);
