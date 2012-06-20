@@ -23,6 +23,8 @@
 #include <linux/spi/flash.h>
 #include <linux/gpio.h>
 #include <linux/leds.h>
+#include <video/dovefb.h>
+#include <video/dovefbreg.h>
 #include <media/gpio-ir-recv.h>
 #include <asm/mach-types.h>
 #include <asm/mach/arch.h>
@@ -36,6 +38,65 @@ static struct mv643xx_eth_platform_data cubox_ge00_data = {
 static struct mv_sata_platform_data cubox_sata_data = {
 	.n_ports	= 1,
 };
+
+/*****************************************************************************
+ * LCD
+ ****************************************************************************/
+/*
+ * LCD HW output Red[0] to LDD[0] when set bit [19:16] of reg 0x190
+ * to 0x0. Which means HW outputs BGR format default. All platforms
+ * uses this controller should enable .panel_rbswap. Unless layout
+ * design connects Blue[0] to LDD[0] instead.
+ */
+static struct dovefb_mach_info dove_cubox_lcd0_dmi = {
+	.id_gfx			= "GFX Layer 0",
+	.id_ovly		= "Video Layer 0",
+	.clk_src		= MRVL_EXT_CLK1,
+	.clk_name		= "SILAB_CLK0",
+	.pix_fmt		= PIX_FMT_RGB888PACK,
+	.io_pin_allocation	= IOPAD_DUMB24,
+	.panel_rgb_type		= DUMB24_RGB888_0,
+	.panel_rgb_reverse_lanes = 0,
+	.gpio_output_data	= 0,
+	.gpio_output_mask	= 0,
+	.secondary_ddc_mode	= 1,
+	.invert_composite_blank	= 0,
+	.invert_pix_val_ena	= 0,
+	.invert_pixclock	= 0,
+	.invert_vsync		= 0,
+	.invert_hsync		= 0,
+	.panel_rbswap		= 1,
+	.active			= 1,
+};
+
+static struct dovefb_mach_info dove_cubox_lcd0_vid_dmi = {
+	.id_ovly		= "Video Layer 0",
+	.pix_fmt		= PIX_FMT_RGB888PACK,
+	.io_pin_allocation	= IOPAD_DUMB24,
+	.panel_rgb_type		= DUMB24_RGB888_0,
+	.panel_rgb_reverse_lanes = 0,
+	.gpio_output_data	= 0,
+	.gpio_output_mask	= 0,
+	.ddc_i2c_adapter	= -1,
+	.invert_composite_blank	= 0,
+	.invert_pix_val_ena	= 0,
+	.invert_pixclock	= 0,
+	.invert_vsync		= 0,
+	.invert_hsync		= 0,
+	.panel_rbswap		= 1,
+	.active			= 0,
+	.enable_lcd0		= 0,
+};
+
+void __init dove_cubox_clcd_init(void)
+{
+#ifdef CONFIG_FB_DOVE
+	/* Last parameter previously used &dove_rd_avng_v3_backlight_data */
+	clcd_platform_init(&dove_cubox_lcd0_dmi, &dove_cubox_lcd0_vid_dmi,
+				NULL, NULL, NULL);
+
+#endif /* CONFIG_FB_DOVE */
+}
 
 /*****************************************************************************
  * SPI Devices:
@@ -136,6 +197,7 @@ static void __init cubox_init(void)
 	dove_sdio0_init();
 	dove_sdio1_init();
 	dove_i2s1_init();
+	dove_cubox_clcd_init();
 	dove_vmeta_init();
 	dove_gpu_init();
 	dove_spi0_init();
