@@ -107,7 +107,7 @@
 #define  IO_PWR_CTRL_PCIE_PHY0	(1 << 16)
 #define  IO_PWR_CTRL_PCIE_PHY1	(1 << 17)
 
-/* Theraml Diode Control 0 Register */
+/* Thermal Diode Control 0 Register */
 #define PMU_TEMP_DIOD_CTRL0_REG	(DOVE_PMU_VIRT_BASE + 0x5C)
 #define  PMU_TDC0_PWR_DWN_MASK		(0x1 << 0)
 #define  PMU_TDC0_SW_RST_MASK		(0x1 << 1)
@@ -138,6 +138,25 @@
 #define  PMU_TDC1_STRT_CAL_MASK		(0x1 << 8)
 #define  PMU_TDC1_CAL_STAT_MASK		(0x1 << 9)
 #define  PMU_TDC1_TEMP_VLID_MASK	(0x1 << 10)
+
+/* Core PLL and Clock Divider Control 0 Register */
+#define PMU_PLL_CLK_DIV_CTRL0_REG	(DOVE_PMU_VIRT_BASE + 0x64)
+#define  PMU_PCTRL0_AXI_BUS_DIV_OFFS	1
+#define  PMU_PCTRL0_AXI_BUS_DIV_MASK	(0x1f << PMU_PCTRL0_AXI_BUS_DIV_OFFS)
+#define  PMU_PCTRL0_AXI_BUS_RATIO_LOAD	7
+#define  PMU_PCTRL0_GPU_CLK_DIV_OFFS	8
+#define  PMU_PCTRL0_GPU_CLK_DIV_MASK	(0x1f << PMU_PCTRL0_GPU_CLK_DIV_OFFS)
+#define  PMU_PCTRL0_GPU_CLK_RATIO_LOAD	14
+#define  PMU_PCTRL0_VMETA_CLK_DIV_OFFS	15
+#define  PMU_PCTRL0_VMETA_CLK_DIV_MASK	(0x1f << PMU_PCTRL0_VMETA_CLK_DIV_OFFS)
+#define  PMU_PCTRL0_VMETA_CLK_RATIO_LOAD 21
+#define  PMU_PCTRL0_LCD_CLK_DIV_OFFS	22
+#define  PMU_PCTRL0_LCD_CLK_DIV_MASK	(0x1f << PMU_PCTRL0_LCD_CLK_DIV_OFFS)
+#define  PMU_PCTRL0_LCD_CLK_RATIO_LOAD	28
+
+/* Core PLL and Clock Divider Control 1 Register */
+#define PMU_PLL_CLK_DIV_CTRL1_REG	(DOVE_PMU_VIRT_BASE + 0x68)
+#define  PMU_PCTRL1_CONF_RESET_MASK	(0x1 << 10)
 
 /* PMU General Control Register */
 #define PMU_GNRL_CTRL_REG	(DOVE_PMU_VIRT_BASE + 0x70)
