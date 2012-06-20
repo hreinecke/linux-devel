@@ -121,8 +121,8 @@ static struct resource dove_vmeta_resources[] = {
 		.flags	= IORESOURCE_MEM,
 	},
 	[2] = {
-		.start  = IRQ_DOVE_VPRO_DMA1,
-		.end    = IRQ_DOVE_VPRO_DMA1,
+		.start  = IRQ_DOVE_VMETA_DMA1,
+		.end    = IRQ_DOVE_VMETA_DMA1,
 		.flags  = IORESOURCE_IRQ,
 	},
 };
