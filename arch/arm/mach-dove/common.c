@@ -39,6 +39,7 @@ static unsigned int dove_vmeta_memory_start;
 static unsigned int dove_gpu_memory_start;
 
 static int get_tclk(void);
+static long get_axi_clk(void);
 
 /*****************************************************************************
  * I/O Address Mapping
@@ -76,11 +77,14 @@ void __init dove_map_io(void)
  * CLK tree
  ****************************************************************************/
 static struct clk *tclk;
+static struct clk *pclk;
 
 static void __init clk_init(void)
 {
 	tclk = clk_register_fixed_rate(NULL, "tclk", NULL, CLK_IS_ROOT,
 				       get_tclk());
+	pclk = clk_register_fixed_rate(NULL, "pll_clk", NULL, CLK_IS_ROOT,
+				       get_axi_clk());
 
 	dove_clkdev_init(tclk);
 }
@@ -444,6 +448,12 @@ static int get_tclk(void)
 {
 	/* use DOVE_RESET_SAMPLE_HI/LO to detect tclk */
 	return 166666667;
+}
+
+static long get_axi_clk(void)
+{
+	/* AXI clock is running at 2000MHz */
+	return 2000000000UL;
 }
 
 static void __init dove_timer_init(void)
