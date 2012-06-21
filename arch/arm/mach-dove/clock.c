@@ -78,7 +78,7 @@ static void dove_clocks_set_vmeta_clock(u32 divider)
 	dove_clocks_set_bits(PMU_PLL_CLK_DIV_CTRL0_REG, 21, 21, 0);
 }
 
-static long gpu_round_rate(struct clk_hw *hw, unsigned long rate,
+static long pll_round_rate(struct clk_hw *hw, unsigned long rate,
 			   unsigned long *prate)
 {
 	unsigned long divider;
@@ -86,8 +86,8 @@ static long gpu_round_rate(struct clk_hw *hw, unsigned long rate,
 
 	divider = *prate;
 	do_div(divider, rate);
-	if (divider > 63)
-		divider = 63;
+	if (divider > 31)
+		divider = 31;
 	if (divider < 1)
 		divider = 1;
 	best_rate = *prate;
@@ -113,18 +113,18 @@ static int gpu_set_rate(struct clk_hw *hw, unsigned long rate,
 	unsigned long divider = parent_rate;
 
 	do_div(divider, rate);
-	if (divider < 1 || divider > 64) {
+	if (divider < 1 || divider > 31) {
 		printk(KERN_ERR "Unsupported gpu clock %lu\n", rate);
 		return -EINVAL;
 	}
-	printk(KERN_INFO "Setting gpu clock to %lu (divider: %u)\n",
+	printk(KERN_INFO "Setting gpu clock to %lu (divider: %lu)\n",
 	       rate, divider);
 	dove_clocks_set_gpu_clock(divider);
 	return 0;
 }
 
 struct clk_ops gpu_clk_ops = {
-	.round_rate	= gpu_round_rate,
+	.round_rate	= pll_round_rate,
 	.recalc_rate	= gpu_recalc_rate,
 	.set_rate	= gpu_set_rate,
 };
@@ -176,8 +176,7 @@ static int axi_set_rate(struct clk_hw *hw, unsigned long rate,
 	}
 
 	if (i == 11) {
-		printk(KERN_ERR "Unsupported AXI clock %lu\n",
-			 rate);
+		printk(KERN_ERR "Unsupported AXI clock %lu\n", rate);
 
 		return -EINVAL;
 	}
@@ -242,23 +241,6 @@ static int vmeta_clk_is_enabled(struct clk_hw *hw)
 	return reg ? 0 : 1;
 }
 
-static long vmeta_round_rate(struct clk_hw *hw, unsigned long rate,
-			   unsigned long *prate)
-{
-	unsigned long divider;
-	unsigned long best_rate;
-
-	divider = *prate;
-	do_div(divider, rate);
-	if (divider > 63)
-		divider = 63;
-	if (divider < 1)
-		divider = 1;
-	best_rate = *prate;
-	do_div(best_rate, divider);
-	return best_rate;
-}
-
 static unsigned long vmeta_recalc_rate(struct clk_hw *clk,
 				       unsigned long parent_rate)
 {
@@ -277,11 +259,11 @@ static int vmeta_set_rate(struct clk_hw *hw, unsigned long rate,
 	unsigned long divider = parent_rate;
 
 	do_div(divider, rate);
-	if (divider < 1 || divider > 64) {
+	if (divider < 1 || divider > 31) {
 		printk(KERN_ERR "Unsupported vmeta clock %lu\n", rate);
 		return -EINVAL;
 	}
-	printk(KERN_INFO "Setting vmeta clock to %lu (divider: %u)\n",
+	printk(KERN_INFO "Setting vmeta clock to %lu (divider: %lu)\n",
 	       rate, divider);
 	dove_clocks_set_vmeta_clock(divider);
 	return 0;
@@ -291,7 +273,7 @@ struct clk_ops vmeta_clk_ops = {
 	.enable		= vmeta_clk_enable,
 	.disable	= vmeta_clk_disable,
 	.is_enabled	= vmeta_clk_is_enabled,
-	.round_rate	= vmeta_round_rate,
+	.round_rate	= pll_round_rate,
 	.recalc_rate	= vmeta_recalc_rate,
 	.set_rate	= vmeta_set_rate,
 };
