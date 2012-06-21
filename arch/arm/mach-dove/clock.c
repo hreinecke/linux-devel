@@ -69,6 +69,15 @@ static void dove_clocks_set_gpu_clock(u32 divider)
 	dove_clocks_set_bits(PMU_PLL_CLK_DIV_CTRL0_REG, 14, 14, 0);
 }
 
+static void dove_clocks_set_vmeta_clock(u32 divider)
+{
+	dove_clocks_set_bits(PMU_PLL_CLK_DIV_CTRL1_REG, 10, 10, 1);
+	dove_clocks_set_bits(PMU_PLL_CLK_DIV_CTRL0_REG, 15, 20, divider);
+	dove_clocks_set_bits(PMU_PLL_CLK_DIV_CTRL0_REG, 21, 21, 1);
+	udelay(1);
+	dove_clocks_set_bits(PMU_PLL_CLK_DIV_CTRL0_REG, 21, 21, 0);
+}
+
 static long gpu_round_rate(struct clk_hw *hw, unsigned long rate,
 			   unsigned long *prate)
 {
@@ -184,6 +193,109 @@ struct clk_ops axi_clk_ops = {
 	.set_rate	= axi_set_rate,
 };
 
+static int vmeta_clk_enable(struct clk_hw *hw)
+{
+	unsigned int reg;
+
+	/* power on */
+	reg = readl(PMU_PWR_SUPLY_CTRL_REG);
+	reg &= ~PMU_PWR_VPU_PWR_DWN_MASK;
+	writel(reg, PMU_PWR_SUPLY_CTRL_REG);
+	/* un-reset unit */
+	reg = readl(PMU_SW_RST_CTRL_REG);
+	reg |= PMU_SW_RST_VIDEO_MASK;
+	writel(reg, PMU_SW_RST_CTRL_REG);
+	/* disable isolators */
+	reg = readl(PMU_ISO_CTRL_REG);
+	reg |= PMU_ISO_VIDEO_MASK;
+	writel(reg, PMU_ISO_CTRL_REG);
+
+	return 0;
+}
+
+static void vmeta_clk_disable(struct clk_hw *hw)
+{
+	unsigned int reg;
+
+	/* enable isolators */
+	reg = readl(PMU_ISO_CTRL_REG);
+	reg &= ~PMU_ISO_VIDEO_MASK;
+	writel(reg, PMU_ISO_CTRL_REG);
+	/* reset unit */
+	reg = readl(PMU_SW_RST_CTRL_REG);
+	reg &= ~PMU_SW_RST_VIDEO_MASK;
+	writel(reg, PMU_SW_RST_CTRL_REG);
+	/* power off */
+	reg = readl(PMU_PWR_SUPLY_CTRL_REG);
+	reg |= PMU_PWR_VPU_PWR_DWN_MASK;
+	writel(reg, PMU_PWR_SUPLY_CTRL_REG);
+}
+
+static int vmeta_clk_is_enabled(struct clk_hw *hw)
+{
+	u32 reg;
+
+	/* Read power down bit */
+	reg = readl(PMU_PWR_SUPLY_CTRL_REG);
+	reg &= PMU_PWR_VPU_PWR_DWN_MASK;
+
+	return reg ? 0 : 1;
+}
+
+static long vmeta_round_rate(struct clk_hw *hw, unsigned long rate,
+			   unsigned long *prate)
+{
+	unsigned long divider;
+	unsigned long best_rate;
+
+	divider = *prate;
+	do_div(divider, rate);
+	if (divider > 63)
+		divider = 63;
+	if (divider < 1)
+		divider = 1;
+	best_rate = *prate;
+	do_div(best_rate, divider);
+	return best_rate;
+}
+
+static unsigned long vmeta_recalc_rate(struct clk_hw *clk,
+				       unsigned long parent_rate)
+{
+	u32 divider;
+	unsigned long rate = parent_rate;
+
+	divider = dove_clocks_get_bits(PMU_PLL_CLK_DIV_CTRL0_REG, 15, 20);
+	do_div(rate, divider);
+
+	return rate;
+}
+
+static int vmeta_set_rate(struct clk_hw *hw, unsigned long rate,
+			  unsigned long parent_rate)
+{
+	unsigned long divider = parent_rate;
+
+	do_div(divider, rate);
+	if (divider < 1 || divider > 64) {
+		printk(KERN_ERR "Unsupported vmeta clock %lu\n", rate);
+		return -EINVAL;
+	}
+	printk(KERN_INFO "Setting vmeta clock to %lu (divider: %u)\n",
+	       rate, divider);
+	dove_clocks_set_vmeta_clock(divider);
+	return 0;
+}
+
+struct clk_ops vmeta_clk_ops = {
+	.enable		= vmeta_clk_enable,
+	.disable	= vmeta_clk_disable,
+	.is_enabled	= vmeta_clk_is_enabled,
+	.round_rate	= vmeta_round_rate,
+	.recalc_rate	= vmeta_recalc_rate,
+	.set_rate	= vmeta_set_rate,
+};
+
 static struct clk __init *dove_register_clk(const char *name,
 					    struct clk_ops *ops,
 					    const char *parent_name)
@@ -226,7 +338,7 @@ void __init dove_clkdev_init(struct clk *tclk)
 	struct clk *clk_pci0, *clk_pci1, *clk_sdio0, *clk_sdio1;
 	struct clk *clk_nand, *clk_camera, *clk_i2s0, *clk_i2s1;
 	struct clk *clk_cesa, *clk_ac97, *clk_pdma, *clk_xor0, *clk_xor1;
-	struct clk *clk_gpu, *clk_axi;
+	struct clk *clk_gpu, *clk_axi, *clk_vmeta;
 
 	clk_usb0 = dove_register_gate("usb.0", CLOCK_GATING_USB0_BIT);
 	clk_usb1 = dove_register_gate("usb.1", CLOCK_GATING_USB1_BIT);
@@ -250,6 +362,7 @@ void __init dove_clkdev_init(struct clk *tclk)
 	clk_xor1 = dove_register_gate("xor.1", CLOCK_GATING_XOR1_BIT);
 	clk_axi = dove_register_clk("axi", &axi_clk_ops, "pll_clk");
 	clk_gpu = dove_register_clk("gpu", &gpu_clk_ops, "pll_clk");
+	clk_vmeta = dove_register_clk("vmeta", &gpu_clk_ops, "pll_clk");
 
 	orion_clkdev_add(NULL, "orion_spi.0", tclk);
 	orion_clkdev_add(NULL, "orion_spi.1", tclk);
@@ -274,5 +387,6 @@ void __init dove_clkdev_init(struct clk *tclk)
 	orion_clkdev_add(NULL, MV_XOR_SHARED_NAME "1", clk_xor1);
 	orion_clkdev_add("GCCLK", NULL, clk_gpu);
 	orion_clkdev_add("AXICLK", NULL, clk_axi);
+	orion_clkdev_add("VMETA_CLK", NULL, clk_vmeta);
 }
 
