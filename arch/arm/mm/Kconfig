@@ -348,7 +348,7 @@ config CPU_FEROCEON_OLD_ID
 
 # Marvell PJ4
 config CPU_PJ4
-	bool
+	bool "Support Marvell PJ4 processor"
 	select CPU_V7
 	select ARM_THUMBEE
 

@@ -541,6 +541,9 @@ config ARCH_DOVE
 	select GENERIC_CLOCKEVENTS
 	select NEED_MACH_IO_H
 	select PLAT_ORION
+	select CLKDEV_LOOKUP
+	select NEED_MACH_MEMORY_H
+	select COMMON_CLK
 	help
 	  Support for the Marvell Dove SoC 88AP510
 
