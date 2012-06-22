@@ -23,6 +23,8 @@
 #include <linux/spi/flash.h>
 #include <linux/gpio.h>
 #include <linux/leds.h>
+#include <linux/clk/si5351.h>
+#include <linux/clk-private.h>
 #include <video/dovefb.h>
 #include <video/dovefbreg.h>
 #include <media/gpio-ir-recv.h>
@@ -102,6 +104,118 @@ void __init dove_cubox_clcd_init(void)
 
 #endif /* CONFIG_FB_DOVE */
 }
+
+/*****************************************************************************
+ * Cubox external clock generator
+ ****************************************************************************/
+static void cubox_extclk_setup(struct device *clkdev)
+{
+	struct clk *clk, *plla, *pllb;
+	int ret;
+
+	clk = plla = pllb = NULL;
+
+	dev_info(clkdev, "external clock setup : clkdev = %p\n", clkdev);
+
+	if (clkdev == NULL)
+		goto cubox_setup_ext_clocks_err;
+
+	plla = clk_get(clkdev, "plla");
+	if (IS_ERR(plla))
+		goto cubox_setup_ext_clocks_err;
+
+	pllb = clk_get(clkdev, "pllb");
+	if (IS_ERR(pllb))
+		goto cubox_setup_ext_clocks_err;
+
+	/* clkout0 : pllA master, dovefb extclk */
+	clk = clk_get(clkdev, "clkout0");
+	if (IS_ERR(clk))
+		goto cubox_setup_ext_clocks_err;
+	clk->flags |= CLK_SET_RATE_PARENT;
+	ret = clk_set_parent(clk, plla);
+	if (ret) {
+		printk(KERN_ERR "failed to set parent for clkout0 : %d\n",
+		       ret);
+		goto cubox_setup_ext_clocks_err;
+	}
+	clk_add_alias("extclk", "dovefb.0", "clkout0", clkdev);
+	clk_put(clk);
+
+	/* clkout1 : pllA slave, hdmi cec clk */
+	clk = clk_get(clkdev, "clkout1");
+	if (IS_ERR(clk))
+		goto cubox_setup_ext_clocks_err;
+	clk_set_parent(clk, plla);
+	clk_add_alias("cec", "tda998x", "clkout1", clkdev);
+	clk_put(clk);
+
+	/* clkout2 : pllB master, i2s1 extclk */
+	clk = clk_get(clkdev, "clkout2");
+	if (IS_ERR(clk))
+		goto cubox_setup_ext_clocks_err;
+	clk->flags |= CLK_SET_RATE_PARENT;
+	clk_set_parent(clk, pllb);
+	clk_add_alias("extclk", "kirkwood-i2s.1", "clkout2", clkdev);
+	clk_put(clk);
+
+	clk_put(plla);
+	clk_put(pllb);
+
+	printk(KERN_INFO "external clock setup done\n");
+	return;
+
+cubox_setup_ext_clocks_err:
+	printk(KERN_ERR "unable to setup external clocks\n");
+
+	printk(KERN_ERR ">>> plla = %p, pllb = %p, clk = %p\n",
+	       plla, pllb, clk);
+
+	if (!IS_ERR(plla))
+		clk_put(plla);
+	if (!IS_ERR(pllb))
+		clk_put(pllb);
+}
+
+static struct si5351_clocks_data cubox_clocks_data = {
+	.fxtal = 25000000,
+	.fclkin = 0,
+	.variant = SI5351_VARIANT_A3,
+	.setup = cubox_extclk_setup,
+};
+
+static struct platform_device cubox_extclk = {
+	.name	= "cubox-extclk",
+	.id	= -1,
+	.dev	= {
+		.platform_data	= &cubox_clocks_data,
+	}
+};
+
+/*****************************************************************************
+ * I2C devices:
+ *      ALC5630 codec, address 0x
+ *      Battery charger, address 0x??
+ *      G-Sensor, address 0x??
+ *      MCU PIC-16F887, address 0x??
+ ****************************************************************************/
+static struct i2c_board_info __initdata dove_cubox_i2c_bus0_devs[] = {
+	{
+		I2C_BOARD_INFO("si5351", SI5351_BUS_ADDR),
+		.platform_data = &cubox_clocks_data,
+	},
+#ifdef CONFIG_TDA19988
+	{ /* First CEC that enables 0x70 for HDMI */
+		I2C_BOARD_INFO("tda99Xcec", 0x34), .irq = 91,
+	},
+	{
+		I2C_BOARD_INFO("tda998X", 0x70), .irq = 91,
+	},
+#endif
+	{
+	I2C_BOARD_INFO("cs42l51", 0x4A), /* Fake device for spdif only */
+	},
+};
 
 /*****************************************************************************
  * SPI Devices:
@@ -210,11 +324,15 @@ static void __init cubox_init(void)
 	dove_uart0_init();
 	dove_uart1_init();
 	dove_i2c_init();
+
+	i2c_register_board_info(0, dove_cubox_i2c_bus0_devs,
+				ARRAY_SIZE(dove_cubox_i2c_bus0_devs));
+	platform_device_register(&cubox_extclk);
+	platform_device_register(&cubox_leds);
+	platform_device_register(&cubox_ir);
 	platform_device_register(&cubox_spdif);
 	spi_register_board_info(cubox_spi_flash_info,
 				ARRAY_SIZE(cubox_spi_flash_info));
-	platform_device_register(&cubox_leds);
-	platform_device_register(&cubox_ir);
 }
 
 MACHINE_START(CUBOX, "SolidRun CuBox")
