@@ -24,22 +24,23 @@
 #include <asm/mach/time.h>
 #include <asm/mach/pci.h>
 #include <mach/dove.h>
+#include <mach/pm.h>
 #include <mach/bridge-regs.h>
 #include <asm/mach/arch.h>
 #include <linux/irq.h>
 #include <plat/time.h>
 #include <plat/ehci-orion.h>
+#include <plat/mv_xor.h>
 #include <plat/common.h>
 #include <plat/addr-map.h>
 #include <plat/audio.h>
+#include <plat/clock.h>
 #include "common.h"
-#include "clock.h"
 
 static unsigned int dove_vmeta_memory_start;
 static unsigned int dove_gpu_memory_start;
 
 static int get_tclk(void);
-static long get_axi_clk(void);
 
 /*****************************************************************************
  * I/O Address Mapping
@@ -77,16 +78,67 @@ void __init dove_map_io(void)
  * CLK tree
  ****************************************************************************/
 static struct clk *tclk;
-static struct clk *pclk;
+
+#define DOVE_SATA_VIRT_BASE	(DOVE_SB_REGS_VIRT_BASE | 0xa0000)
+
+static struct orion_clk_gate dove_clk_gates[] = {
+	ORION_CLK_GATE("usb0", CLOCK_GATING_USB0_BIT),
+	ORION_CLK_GATE("usb1", CLOCK_GATING_USB1_BIT),
+	ORION_CLK_GATE("sdio0", CLOCK_GATING_SDIO0_BIT),
+	ORION_CLK_GATE("sdio1", CLOCK_GATING_SDIO1_BIT),
+	ORION_CLK_GATE("nand", CLOCK_GATING_NAND_BIT),
+	ORION_CLK_GATE("camera", CLOCK_GATING_CAMERA_BIT),
+	ORION_CLK_GATE("i2s0", CLOCK_GATING_I2S0_BIT),
+	ORION_CLK_GATE("i2s1", CLOCK_GATING_I2S1_BIT),
+	ORION_CLK_GATE("crypto", CLOCK_GATING_CRYPTO_BIT),
+	ORION_CLK_GATE("ac97", CLOCK_GATING_AC97_BIT),
+	ORION_CLK_GATE("pdma", CLOCK_GATING_PDMA_BIT),
+	ORION_CLK_GATE("xor0", CLOCK_GATING_XOR0_BIT),
+	ORION_CLK_GATE("xor1", CLOCK_GATING_XOR1_BIT),
+	ORION_CLK_GATE("gephy0", CLOCK_GATING_GIGA_PHY_BIT),
+	ORION_CLK_PHYGATE("ge0", CLOCK_GATING_GBE_BIT, "gephy0"),
+	ORION_CLK_PHYGATE("sata", CLOCK_GATING_SATA_BIT, DOVE_SATA_VIRT_BASE),
+	ORION_CLK_PHYGATE("pex0", CLOCK_GATING_PCIE0_BIT, DOVE_PCIE0_VIRT_BASE),
+	ORION_CLK_PHYGATE("pex1", CLOCK_GATING_PCIE1_BIT, DOVE_PCIE1_VIRT_BASE),
+};
+
+static struct orion_clk_clock dove_clk_clocks[] = {
+	ORION_CLK_CLOCK(NULL, "orion_spi.0", "tclk"),
+	ORION_CLK_CLOCK(NULL, "orion_spi.1", "tclk"),
+	ORION_CLK_CLOCK(NULL, "orion_wdt", "tclk"),
+	ORION_CLK_CLOCK(NULL, "orion-ehci.0", "usb0"),
+	ORION_CLK_CLOCK(NULL, "orion-ehci.1", "usb1"),
+	ORION_CLK_CLOCK(NULL, "sdhci-dove.0", "sdio0"),
+	ORION_CLK_CLOCK(NULL, "sdhci-dove.1", "sdio1"),
+	ORION_CLK_CLOCK(NULL, "dove-nand", "nand"),
+	ORION_CLK_CLOCK(NULL, "cafe1000-ccic.0", "camera"),
+	ORION_CLK_CLOCK(NULL, "kirkwood-i2s.0", "i2s0"),
+	ORION_CLK_CLOCK(NULL, "kirkwood-i2s.1", "i2s1"),
+	ORION_CLK_CLOCK(NULL, "mv_crypto", "crypto"),
+	ORION_CLK_CLOCK(NULL, "dove-ac97", "ac97"),
+	ORION_CLK_CLOCK(NULL, "dove-pdma", "pdma"),
+	ORION_CLK_CLOCK(NULL, MV_XOR_SHARED_NAME ".0", "xor0"),
+	ORION_CLK_CLOCK(NULL, MV_XOR_SHARED_NAME ".1", "xor1"),
+	ORION_CLK_CLOCK(NULL, MV643XX_ETH_NAME ".0", "ge0"),
+	ORION_CLK_CLOCK("0", "sata_mv.0", "sata"),
+	ORION_CLK_CLOCK("0", "pcie", "pex0"),
+	ORION_CLK_CLOCK("1", "pcie", "pex1"),
+};
+
+static struct orion_clk_platform_data dove_clk_data = {
+	.iocgc = (void __iomem *)CLOCK_GATING_CONTROL,
+	.gates = dove_clk_gates,
+	.num_gates = ARRAY_SIZE(dove_clk_gates),
+	.clocks = dove_clk_clocks,
+	.num_clocks = ARRAY_SIZE(dove_clk_clocks),
+};
 
 static void __init clk_init(void)
 {
 	tclk = clk_register_fixed_rate(NULL, "tclk", NULL, CLK_IS_ROOT,
 				       get_tclk());
-	pclk = clk_register_fixed_rate(NULL, "pll_clk", NULL, CLK_IS_ROOT,
-				       get_axi_clk());
 
-	dove_clkdev_init(tclk);
+	orion_clk_init(&dove_clk_data, tclk);
 }
 
 /*****************************************************************************
@@ -448,12 +500,6 @@ static int get_tclk(void)
 {
 	/* use DOVE_RESET_SAMPLE_HI/LO to detect tclk */
 	return 166666667;
-}
-
-static long get_axi_clk(void)
-{
-	/* AXI clock is running at 2000MHz */
-	return 2000000000UL;
 }
 
 static void __init dove_timer_init(void)
