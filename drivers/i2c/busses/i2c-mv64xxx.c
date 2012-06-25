@@ -15,6 +15,7 @@
 #include <linux/spinlock.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/delay.h>
 #include <linux/mv643xx_i2c.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
@@ -64,6 +65,7 @@ enum {
 	MV64XXX_I2C_STATE_WAITING_FOR_ADDR_2_ACK,
 	MV64XXX_I2C_STATE_WAITING_FOR_SLAVE_ACK,
 	MV64XXX_I2C_STATE_WAITING_FOR_SLAVE_DATA,
+	MV64XXX_I2C_STATE_WAITING_FOR_REPEATED_START,
 };
 
 /* Driver actions */
@@ -78,6 +80,7 @@ enum {
 	MV64XXX_I2C_ACTION_RCV_DATA,
 	MV64XXX_I2C_ACTION_RCV_DATA_STOP,
 	MV64XXX_I2C_ACTION_SEND_STOP,
+	MV64XXX_I2C_ACTION_NO_STOP,
 };
 
 struct mv64xxx_i2c_data {
@@ -98,6 +101,8 @@ struct mv64xxx_i2c_data {
 	int			rc;
 	u32			freq_m;
 	u32			freq_n;
+	u32			delay_after_stop;
+	int			irq_disabled;
 	wait_queue_head_t	waitq;
 	spinlock_t		lock;
 	struct i2c_msg		*msg;
@@ -112,6 +117,26 @@ struct mv64xxx_i2c_data {
  *****************************************************************************
  */
 
+static void
+mv64xxx_i2c_wait_after_stop(struct mv64xxx_i2c_data *drv_data)
+{
+	int i = 0;
+
+	udelay(drv_data->delay_after_stop);
+
+	/* wait for the stop bit up to 100 usec more */
+	while (readl(drv_data->reg_base + MV64XXX_I2C_REG_CONTROL) &
+	       MV64XXX_I2C_REG_CONTROL_STOP){
+		udelay(1);
+		if (i++ > 100) {
+			dev_err(&drv_data->adapter.dev,
+				" I2C bus locked, stop bit not cleared\n");
+			break;
+		}
+	}
+
+}
+
 /* Reset hardware and initialize FSM */
 static void
 mv64xxx_i2c_hw_init(struct mv64xxx_i2c_data *drv_data)
@@ -123,6 +148,7 @@ mv64xxx_i2c_hw_init(struct mv64xxx_i2c_data *drv_data)
 	writel(0, drv_data->reg_base + MV64XXX_I2C_REG_EXT_SLAVE_ADDR);
 	writel(MV64XXX_I2C_REG_CONTROL_TWSIEN | MV64XXX_I2C_REG_CONTROL_STOP,
 		drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
+	mv64xxx_i2c_wait_after_stop(drv_data);
 	drv_data->state = MV64XXX_I2C_STATE_IDLE;
 }
 
@@ -255,6 +281,11 @@ mv64xxx_i2c_do_action(struct mv64xxx_i2c_data *drv_data)
 	case MV64XXX_I2C_ACTION_SEND_START:
 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_START,
 			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
+		if (drv_data->irq_disabled){
+			udelay(3);
+			drv_data->irq_disabled = 0;
+			enable_irq(drv_data->irq);
+		}
 		break;
 
 	case MV64XXX_I2C_ACTION_SEND_ADDR_1:
@@ -291,8 +322,18 @@ mv64xxx_i2c_do_action(struct mv64xxx_i2c_data *drv_data)
 		drv_data->cntl_bits &= ~MV64XXX_I2C_REG_CONTROL_INTEN;
 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_STOP,
 			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
+		mv64xxx_i2c_wait_after_stop(drv_data);
 		drv_data->block = 0;
-		wake_up_interruptible(&drv_data->waitq);
+		wake_up(&drv_data->waitq);
+		break;
+	case MV64XXX_I2C_ACTION_NO_STOP:
+		/* can't mask interrupts by clearing the INTEN as this
+		 * triggers the controller to send the data.
+		 */
+		drv_data->irq_disabled = 1;
+		disable_irq_nosync(drv_data->irq);
+		drv_data->block = 0;
+		wake_up(&drv_data->waitq);
 		break;
 
 	case MV64XXX_I2C_ACTION_INVALID:
@@ -306,8 +347,9 @@ mv64xxx_i2c_do_action(struct mv64xxx_i2c_data *drv_data)
 		drv_data->cntl_bits &= ~MV64XXX_I2C_REG_CONTROL_INTEN;
 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_STOP,
 			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
+		mv64xxx_i2c_wait_after_stop(drv_data);
 		drv_data->block = 0;
-		wake_up_interruptible(&drv_data->waitq);
+		wake_up(&drv_data->waitq);
 		break;
 	}
 }
@@ -327,6 +369,8 @@ mv64xxx_i2c_intr(int irq, void *dev_id)
 		mv64xxx_i2c_fsm(drv_data, status);
 		mv64xxx_i2c_do_action(drv_data);
 		rc = IRQ_HANDLED;
+		if (drv_data->state == MV64XXX_I2C_STATE_WAITING_FOR_REPEATED_START)
+			break;
 	}
 	spin_unlock_irqrestore(&drv_data->lock, flags);
 
@@ -548,6 +592,8 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 
 	drv_data->freq_m = pdata->freq_m;
 	drv_data->freq_n = pdata->freq_n;
+	drv_data->delay_after_stop = pdata->delay_after_stop ?
+		pdata->delay_after_stop : 10;
 	drv_data->irq = platform_get_irq(pd, 0);
 	if (drv_data->irq < 0) {
 		rc = -ENXIO;
@@ -559,6 +605,7 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 	drv_data->adapter.class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
 	drv_data->adapter.timeout = msecs_to_jiffies(pdata->timeout);
 	drv_data->adapter.nr = pd->id;
+	drv_data->irq_disabled = 0;
 	platform_set_drvdata(pd, drv_data);
 	i2c_set_adapdata(&drv_data->adapter, drv_data);
 

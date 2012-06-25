@@ -16,6 +16,7 @@
 struct mv64xxx_i2c_pdata {
 	u32	freq_m;
 	u32	freq_n;
+	u32	delay_after_stop;
 	u32	timeout;	/* In milliseconds */
 };
 

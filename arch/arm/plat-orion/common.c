@@ -497,6 +497,7 @@ void __init orion_ge00_switch_init(struct dsa_platform_data *d, int irq)
 static struct mv64xxx_i2c_pdata orion_i2c_pdata = {
 	.freq_n		= 3,
 	.timeout	= 1000, /* Default timeout of 1 second */
+	.delay_after_stop = 3,
 };
 
 static struct resource orion_i2c_resources[2];
