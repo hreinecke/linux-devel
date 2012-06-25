@@ -429,14 +429,14 @@ static unsigned long si5351_pll_recalc_rate(struct clk_hw *hw,
 }
 
 static long si5351_pll_round_rate(struct clk_hw *hw, unsigned long rate,
-				  unsigned long *parent_rate)
+				  unsigned long *prate)
 {
 	struct si5351_hw_data *hwdata =
 		container_of(hw, struct si5351_hw_data, hw);
-	unsigned long p1, p2, p3;
+	unsigned long p1, p2, p3, parent_rate = *prate;
 
 	si5351_dbg("%s : parent_rate = %p, rate = %lu\n",
-		   hw->clk->name, parent_rate, rate);
+		   hw->clk->name, prate, rate);
 
 	if (rate < SI5351_PLL_VCO_MIN)
 		rate = SI5351_PLL_VCO_MIN;
@@ -1078,6 +1078,7 @@ static __devinit int si5351_i2c_probe(
 	sidata->pll[0].num = 0;
 	sidata->pll[0].sidata = sidata;
 	init.name = "plla";
+	init.ops = &si5351_pll_ops;
 	init.flags = 0;
 	init.parent_names = si5351_common_pll_parents;
 	init.num_parents = num_parents;
